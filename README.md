@@ -3,22 +3,7 @@
 NJ TRANSIT track estimates at New York Penn Station, in your terminal: the departure board and train
 details from [pennahead.com](https://pennahead.com), full screen with vim keys.
 
-```
-┌─┐ALL⁰ •NEC¹ •NJCL² •M&E³ •RARV⁴ •MOBO⁵┌─┐⇄SECˢ ✈EWRᵉ┌─┐ALERTSᵃ 4┌────┐┌─┐#3887┌─┐Trenton┌─┐•NEC┌──────┐9:06 PM · in 11m┌─┐
-│                                                                      ││                                                  │
-│ TIME    IN         TRAIN  LINE   DESTINATION           TRACK         ││ ▄▄▄▄▄▄▄▄▄                                        ┃
-│ 9:06PM  11M        #3887  •NEC   Trenton ⇄ ✈            13*  ⣿⣿⣿⣿⣿ ▶ ┃│  ▄█  ▀▀█   TRACK  * estimate                     │
-│ 9:23PM  28M        #3289  •NJCL  Long Branch ⇄ ✈        01*  ⣿⣿⣿⣿⣿   ││   █  ▀▀█   HIGH 90%+  ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿                 │
-│ 9:32PM  37M        #6295  •MOBO  MSU ⇄                  04*  ⣿⣿⣿⣿⣿   ││  ▀▀▀ ▀▀▀                                         │
-│ 9:35PM  40M        #3889  •NEC   Trenton ⇄ ✈            03*  ⣿⣿⣿⣿⣿   ││                                                  │
-│                                                                      ││ ⇄Stops at Secaucus  ·  ✈Newark Airport           │
-│ 20+ min away                                                         ││                                                  │
-│ 9:48PM  53M        #5155  •RARV  Raritan ⇄              --           ││ How this estimate works                          │
-│ 9:51PM  56M        #6675  •M&E   Dover ⇄                --           ││ Track 13 has an estimated 90%+ chance because    │
-│ 10:07PM 72M        #3737  •NEC   Jersey Avenue ⇄ ✈      --           ││ this train's equipment is already on that        │
-│ 10:11PM 76M        #3979  •NEC   Trenton ⇄              --           ││ platform. Past track assignments below cover the │
-└─┘PennAhead└─┘NY Penn · NJ TRANSIT└──────┘8:55:17 PM└─┘↻ 9s└─┘? help└─┘└─┘l details└──────────────────────────────────────┘
-```
+![PennAhead in a terminal: departures on the left, the selected train's track and details on the right](screenshot.png)
 
 PennAhead is an independent service, not affiliated with or licensed by NJ TRANSIT® or Amtrak®.
 Tracks marked `*` are estimates and can be wrong; NJ TRANSIT can change a track at any time. Always

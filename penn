@@ -18,7 +18,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.1.1';
 const DEFAULT_URL = 'https://pennahead.com';
 const MIN_INTERVAL_S = 10; // the site's own board refreshes every 10 s per open tab
 const LINES = ['NEC', 'NJCL', 'M&E', 'RARV', 'MOBO'];
@@ -996,7 +996,8 @@ function detectTheme(opts, stream) {
   return makeTheme({ color, truecolor, ascii });
 }
 
-const termWidth = (stream) => Math.max(48, Math.min(stream.columns || 100, 140));
+// The terminal's full width (100 when it isn't a terminal, e.g. piped), 48 at the least
+const termWidth = (stream) => Math.max(48, stream.columns || 100);
 
 // Keys from raw stdin: one chunk can hold several keys
 export function parseKeys(chunk) {
@@ -1238,7 +1239,7 @@ async function runInteractive(opts) {
   }
 
   function draw() {
-    const width = Math.max(48, Math.min(out.columns || 100, 260));
+    const width = termWidth(out);
     const height = Math.max(8, out.rows || 24);
     const footer = footerLines(width, theme, DATA_LINE);
     const bodyH = Math.max(6, height - footer.length);
