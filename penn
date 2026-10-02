@@ -13,13 +13,16 @@
  * check that they still match.
  */
 
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const VERSION = '0.1.1';
+export const VERSION = '0.2.0';
 const DEFAULT_URL = 'https://pennahead.com';
+// Releases: the public repo holds what the install command downloads (penn) and its version.json
+const RELEASE_URL = 'https://raw.githubusercontent.com/the2ndday/pennahead-cli/main';
 const MIN_INTERVAL_S = 10; // the site's own board refreshes every 10 s per open tab
 const LINES = ['NEC', 'NJCL', 'M&E', 'RARV', 'MOBO'];
 const LINE_ALIASES = { NEC: 'NEC', NJCL: 'NJCL', 'M&E': 'M&E', ME: 'M&E', MNE: 'M&E', RARV: 'RARV', MOBO: 'MOBO' };
@@ -53,6 +56,21 @@ const INDEPENDENT_LINE =
 /** The app's formatPct */
 export function formatPct(pct) {
   return pct >= 90 ? '90%+' : `${pct}%`;
+}
+
+/** The app's formatClock: AM / PM after a no-break space, so a time never splits ("7:57 PM") */
+export function formatClock(text) {
+  return String(text).replace(/(\d)\s*([AP])\.?M\.?\b/gi, (_, digit, ap) => `${digit}\u00A0${ap.toUpperCase()}M`);
+}
+
+/** "11:28 AM" plus 7 minutes → "11:35 AM" (wraps past noon and midnight); unparsed times stay as is */
+export function addMinutes(time, minutes) {
+  const m = String(time).match(/(\d{1,2}):(\d{2})\s*([AP])\.?M/i);
+  if (!m) return time;
+  const h12 = Number(m[1]) % 12;
+  const total = ((((h12 + (m[3].toUpperCase() === 'P' ? 12 : 0)) * 60 + Number(m[2]) + minutes) % 1440) + 1440) % 1440;
+  const h = Math.floor(total / 60);
+  return `${h % 12 || 12}:${String(total % 60).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`;
 }
 
 /** The app's cleanDestination */
@@ -147,20 +165,22 @@ export function makeTheme({ color = true, truecolor = true, ascii = false } = {}
     return bg + line.replaceAll('\x1b[0m', `\x1b[0m${bg}`) + '\x1b[0m';
   };
   const g = ascii
-    ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', lt: '+', rt: '+', tL: '[', tR: ']', bL: '[', bR: ']', dot: 'o', on: '#', half: '#', off: '.', sec: 'SEC', ewr: 'EWR', sel: '>', ell: '~', cursor: '_' }
-    : { tl: '┌', tr: '┐', bl: '└', br: '┘', h: '─', v: '│', lt: '├', rt: '┤', tL: '┐', tR: '┌', bL: '┘', bR: '└', dot: '•', on: '⣿', half: '⡇', off: '⣀', sec: '⇄', ewr: '✈', sel: '▶', ell: '…', cursor: '▏' };
+    ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', lt: '+', rt: '+', tL: '[', tR: ']', bL: '[', bR: ']', dot: 'o', on: '#', half: '#', off: '.', sec: 'SEC', ewr: 'EWR', stopEnd: '*', stopMid: 'o', open: '^', closed: 'v', sel: '>', ell: '~', cursor: '_' }
+    : { tl: '┌', tr: '┐', bl: '└', br: '┘', h: '─', v: '│', lt: '├', rt: '┤', tL: '┐', tR: '┌', bL: '┘', bR: '└', dot: '•', on: '⣿', half: '⡇', off: '⣀', sec: '⇄', ewr: '✈', stopEnd: '●', stopMid: '○', open: '▴', closed: '▾', sel: '▶', ell: '…', cursor: '▏' };
   // ASCII mode: fold the few non-ASCII characters in the copy (superscript hints, dashes, ®)
   const fold = (text) => (ascii ? text.replace(/[^\x00-\x7f]/g, (ch) => ASCII_FOLD[ch] ?? '?') : text);
   return { color, ascii, style, highlight, g, fold };
 }
 
-const ASCII_FOLD = { '•': 'o', '⇄': 'SEC', '✈': 'EWR', 'ˢ': 's', 'ᵉ': 'e', 'ᵃ': 'a', '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '·': '-', '–': '-', '—': '-', '…': '...', '®': '(R)', '→': '->', '←': '<-', '↓': 'down', '↑': 'up', '’': "'", '↻': '' };
+const ASCII_FOLD = { 'ᵈ': 'd', 'ᵗ': 't', '\u00A0': ' ', '•': 'o', '⇄': 'SEC', '✈': 'EWR', 'ˢ': 's', 'ᵉ': 'e', 'ᵃ': 'a', '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '·': '-', '–': '-', '—': '-', '…': '...', '®': '(R)', '→': '->', '←': '<-', '↓': 'down', '↑': 'up', '’': "'", '↻': '' };
 
 // ¹nec ²njcl …: btop-style hotkey hints in box titles
 const SUP = ['⁰', '¹', '²', '³', '⁴', '⁵'];
 const SUP_S = 'ˢ';
 const SUP_E = 'ᵉ';
 const SUP_A = 'ᵃ';
+const SUP_D = 'ᵈ';
+const SUP_T = 'ᵗ';
 
 function truncate(text, w, theme) {
   const chars = Array.from(text);
@@ -173,7 +193,8 @@ export function wrap(text, width) {
   const out = [];
   for (const para of String(text).split('\n')) {
     let line = '';
-    for (const word of para.split(/\s+/).filter(Boolean)) {
+    // Split on ordinary spaces only: a no-break space (as in "7:57 PM") keeps its words together
+    for (const word of para.split(/[ \t\r]+/).filter(Boolean)) {
       if (!line) line = word;
       else if (visibleLength(line) + 1 + visibleLength(word) <= width) line += ` ${word}`;
       else {
@@ -248,7 +269,7 @@ export function orderDepartures(departures) {
 
 // Column plan for a content width: optional columns drop as the terminal narrows
 function boardColumns(inner, { selectable }) {
-  const cols = { sel: selectable ? 1 : 0, time: 7, rel: 7, train: 6, line: 6, status: 10, track: 5, label: 9, meter: 10 };
+  const cols = { sel: selectable ? 1 : 0, time: 8, rel: 9, train: 6, line: 6, status: 10, track: 5, label: 9, meter: 10 };
   const total = () => Object.values(cols).filter((w) => w > 0).reduce((n, w) => n + w + 1, -1);
   const minDest = 20; // room for "Long Branch SEC EWR"; the bars give way first
   // As space runs out: a shorter bar, then the status moves into the countdown's place, then the
@@ -302,9 +323,9 @@ function boardRow(train, cols, theme, { selected = false } = {}) {
   else if (isDelayed(train)) [statusText, statusStyle] = [train.status.toUpperCase(), { fg: RED, bold: true }];
   else if (train.status && status !== 'ON TIME') statusText = train.status.toUpperCase();
 
-  const time = train.dep_time.replace(/\s+/g, '');
+  const time = formatClock(train.dep_time);
   // The countdown without "IN" (the column is headed IN): 12M, NOW, 1M AGO
-  let rel = train.delay ? `~${train.delay.dep_time.replace(/\s+/g, '')}` : formatRelTime(train.rel_time).replace(/^IN /, '');
+  let rel = train.delay ? `~${formatClock(train.delay.dep_time)}` : formatRelTime(train.rel_time).replace(/^IN /, '');
   // No status column on narrow terminals: the status takes the countdown's place
   if (!cols.status && statusText) rel = statusText;
 
@@ -348,7 +369,7 @@ const alertTime = (a) => (a.timestamp || '').replace(/^Posted\s+/i, '').replace(
 function alertRow(alert, inner, theme, { selectable, selected }) {
   const { style, g } = theme;
   const color = LINE_COLORS[alert.lines?.[0]] || AMBER;
-  const lead = `${style(g.dot, { fg: color })}${style(padTo(truncate(alert.tag || 'ALERT', 5, theme), 5), { bold: true, fg: AMBER })} ${style(padTo(alertTime(alert), 8), { dim: true })} `;
+  const lead = `${style(g.dot, { fg: color })}${style(padTo(truncate(alert.tag || 'ALERT', 5, theme), 5), { bold: true, fg: AMBER })} ${style(padTo(formatClock(alertTime(alert)), 8), { dim: true })} `;
   // The ▶ at the right end, as on train rows
   const tail = selectable ? 2 : 0;
   const room = Math.max(4, inner - visibleLength(lead) - tail);
@@ -427,12 +448,12 @@ export function buildBoardBody(data, opts, theme, width) {
 }
 
 const nyTime = (iso, seconds = false) =>
-  new Date(iso || Date.now()).toLocaleTimeString('en-US', {
+  formatClock(new Date(iso || Date.now()).toLocaleTimeString('en-US', {
     timeZone: 'America/New_York',
     hour: 'numeric',
     minute: '2-digit',
     ...(seconds && { second: '2-digit' }),
-  });
+  }));
 
 /**
  * The list box's borders: filters on top (with key hints when interactive), PennAhead, alerts and
@@ -445,6 +466,7 @@ function boardBorders(data, opts, theme, alerts) {
   if (data.error) bottomRight.push(style('offline', { fg: RED, bold: true }));
   bottomRight.push(style(nyTime(data.fetchedAt, true), { bold: true }));
   if (opts.countdown != null) bottomRight.push(style(`${theme.ascii ? 'next' : '↻'} ${opts.countdown}s`, { dim: true }));
+  if (opts.update) bottomRight.unshift(style(`penn ${opts.update} is out · penn --update`, { fg: AMBER, bold: true }));
   if (opts.interactive) bottomRight.push(style('? help', { dim: true }));
   // ALERTSᵃ beside the filters, lit while the alerts are shown. The count is red only while some
   // alerts haven't been seen yet (opts.seen: alert IDs already shown), as on the site
@@ -484,7 +506,13 @@ function footerLines(width, theme, text = `${DATA_LINE} ${INDEPENDENT_LINE}`) {
 
 // Section headings are bold lines aligned with the text under them (box titles stay in the borders)
 function renderBodyLine(line, width, theme, color = BORDER) {
-  if (line.divider) return boxRow(' '.repeat(line.indent || 0) + theme.style(line.divider, { bold: true }), width, theme, color);
+  if (line.divider) {
+    // A collapsible section shows its caret on the right (▾ closed, ▴ open), Stops its note
+    const right = line.note ? theme.style(line.note, { dim: true }) : line.section ? theme.style(line.open ? theme.g.open : theme.g.closed, { bold: true }) : '';
+    const left = ' '.repeat(line.indent || 0) + theme.style(line.divider, { bold: true });
+    const row = boxRow(right ? padTo(left, width - 4 - visibleLength(right)) + right : left, width, theme, color);
+    return line.selected ? highlightInner(row, theme, color) : row;
+  }
   const row = boxRow(line.text, width, theme, color);
   return line.selected ? highlightInner(row, theme, color) : row;
 }
@@ -557,12 +585,23 @@ export function bigDigits(text) {
   return rows;
 }
 
-/** Body lines for one train (inside the box) */
-export function buildTrainBody(train, theme, width) {
-  const { style } = theme;
+// The collapsible sections, as on the site's sheet (closed by default in the full-screen view)
+export const SECTIONS = ['estimate', 'access'];
+// Their keys, shown as superscripts on the headings like the filters' (d: Estimate details, t: Track access)
+export const SECTION_KEYS = { d: 'estimate', t: 'access' };
+
+/**
+ * Body lines for one train (inside the box). opts.open: the open sections (a Set of SECTIONS keys;
+ * true = all, for printing once); opts.stops: its stops from /api/stops, or none. Section heading
+ * lines carry `section` and `open`; their content lines carry `inSection`.
+ */
+export function buildTrainBody(train, theme, width, opts = {}) {
+  const { style, g } = theme;
   const inner = width - 4;
   const lines = [];
-  const para = (text, o) => wrap(text, inner).forEach((l) => lines.push({ text: o ? style(l, o) : l }));
+  const isOpen = (key) => opts.open === true || Boolean(opts.open?.has?.(key));
+  // Times in every sentence written one way (formatClock)
+  const para = (text, o) => wrap(formatClock(text), inner).forEach((l) => lines.push({ text: o ? style(l, o) : l }));
   // A blank line, then the section's divider (sentence case, as in the site's train sheet)
   const section = (title) => {
     if (lines.length && lines[lines.length - 1].text !== '') lines.push({ text: '' });
@@ -607,125 +646,153 @@ export function buildTrainBody(train, theme, width) {
   }
   const status = (train.status || '').toUpperCase();
   const facts = [];
-  if (train.delay) facts.push(style(`Running about ${train.delay.minutes} min late, now ~${train.delay.dep_time}`, { fg: RED, bold: true }));
+  if (train.delay) facts.push(style(`Running about ${train.delay.minutes} min late, now ~${formatClock(train.delay.dep_time)}`, { fg: RED, bold: true }));
   if (status && status !== 'ON TIME' && !canceled) facts.push(style(status, { bold: true, fg: status.includes('BOARD') ? GREEN : isDelayed(train) ? RED : undefined }));
-  if (train.sec) facts.push(`${style(theme.g.sec, { fg: TRANSFER, bold: true })}${style('Stops at Secaucus', { dim: true })}`);
-  if (train.airport) facts.push(`${style(theme.g.ewr, { fg: TRANSFER, bold: true })}${style('Newark Airport', { dim: true })}`);
+  if (train.sec) facts.push(`${style(g.sec, { fg: TRANSFER, bold: true })}${style('Stops at Secaucus', { dim: true })}`);
+  if (train.airport) facts.push(`${style(g.ewr, { fg: TRANSFER, bold: true })}${style('Newark Airport', { dim: true })}`);
   if (facts.length) {
     const joined = facts.join(style('  ·  ', { dim: true }));
     // One line when it fits, else one fact per line
     if (visibleLength(joined) <= inner) lines.push({ text: joined });
     else facts.forEach((f) => lines.push({ text: visibleLength(f) <= inner ? f : truncate(stripAnsi(f), inner, theme) }));
   }
+  // Announced, canceled and later trains: one line under the track, as on the site's sheet
+  if (canceled) para('This departure has been canceled by NJ Transit. No track will be assigned.', { dim: true });
+  else if (later) para(`Track prediction will be available 20 minutes before departure (${train.dep_time}).`, { dim: true });
+  else if (confirmed) para('Track announced by NJ Transit', { dim: true });
 
-  section(reasoning ? 'How this estimate works' : 'Key factors');
-  if (canceled) para('This departure has been canceled by NJ Transit. No track will be assigned.');
-  else if (later) para(`Track prediction will be available 20 minutes before departure (${train.dep_time}).`);
-  else if (confirmed) para('Track announced by NJ Transit');
-  else if (reasoning) {
-    const { signals = [], excluded = [], reliability, equipment, approach, platform } = reasoning;
-    const lead = equipment ?? approach;
-    const pct = formatPct(train.confidence);
-    if (lead) {
-      const why = equipment
-        ? "because this train's equipment is already on that platform."
-        : approach.farEnd
-          ? "because this train's equipment is at the far end of that track."
-          : "because this train's equipment is approaching the platforms on a signal circuit that usually leads there.";
-      para(`Track ${track} has an estimated ${pct} chance ${why} Past track assignments below cover the rest.`);
-    } else {
-      const platformNote =
-        platform && platform.pct > train.confidence
-          ? ` Tracks ${platform.tracks.join(' and ')} share a platform: ${formatPct(platform.pct)} chance it's one of them.`
-          : '';
-      para(
-        `Track ${track} has an estimated ${pct} chance.${platformNote} PennAhead combines the past track assignments below, giving more weight to signals with more records, then rules out tracks that are announced for, occupied by, or more likely for other trains.`
-      );
-    }
+  // A collapsible section: its heading, then (when open) its content, tagged for za / Enter
+  const collapsible = (key, title, content) => {
+    if (lines.length && lines[lines.length - 1].text !== '') lines.push({ text: '' });
+    const open = isOpen(key);
+    // The section's key after its title, as a superscript (interactive views only)
+    const hint = opts.keys ? Object.keys(SECTION_KEYS).find((k) => SECTION_KEYS[k] === key) : null;
+    lines.push({ divider: hint ? `${title}${hint === 'd' ? SUP_D : SUP_T}` : title, section: key, open });
+    if (!open) return;
+    const from = lines.length;
+    content();
+    for (let i = from; i < lines.length; i++) lines[i].inSection = key;
+  };
 
-    if (equipment) {
-      gap();
-      sub('Equipment position');
-      para(
-        `NJ TRANSIT last reported this train's equipment on Track ${equipment.track} (signal circuit ${equipment.circuit}${equipment.observedAt ? `, ${equipment.observedAt}` : ''}); the circuit name identifies the platform. Trains almost always leave from the platform their equipment is on${equipment.total > 0 ? `: equipment-based estimates matched NJ TRANSIT's announced track on ${num(equipment.hits)} of ${num(equipment.total)} departures checked.` : '.'}`
-      );
-    } else if (approach?.farEnd) {
-      gap();
-      sub('Equipment position');
-      para(
-        `NJ TRANSIT reports this train's equipment on signal circuit ${approach.circuit}${approach.observedAt ? ` (${approach.observedAt})` : ''}, the far end of Track ${approach.track}. Departures whose equipment was there before the track was announced left from that track on ${num(approach.hits)} of ${num(approach.total)} departures checked.`
-      );
-    } else if (approach) {
-      gap();
-      sub('Equipment position');
-      para(
-        `NJ TRANSIT last reported this train's equipment on signal circuit ${approach.circuit}${approach.observedAt ? ` (${approach.observedAt})` : ''}, on its way to the platforms. Departures whose equipment was seen there before the track was announced left from Track ${approach.track} on ${num(approach.hits)} of ${num(approach.total)} departures checked.`
-      );
-    } else if (reasoning.equipmentConflict) {
-      const c = reasoning.equipmentConflict;
-      gap();
-      sub('Equipment position');
-      para(`This train's equipment is on Track ${c.track}, but that track is announced for ${whoLabel(c.operator, c.train_id)} (${c.dep_time}), so this estimate uses past track assignments instead.`);
-    }
-
-    section(lead ? `Past track assignments for Track ${track}` : `Evidence for Track ${track}`);
-    const mw = Math.min(10, Math.max(4, inner - 40));
-    signals.forEach((s, i) => {
-      if (i) gap();
-      const weight = `${meter(s.weightPct, mw, TIER[tier].fg, theme)} ${style(`${String(s.weightPct).padStart(3)}% weight`, { dim: true })}`;
-      const counts = `Track ${track} on ${num(s.count)} of ${num(s.total)} departures (${s.total > 0 ? Math.round((s.count / s.total) * 100) : 0}%)`;
-      wrap(s.label, inner).forEach((l) => lines.push({ text: style(l, { bold: true }) }));
-      lines.push({ text: padTo(style(truncate(counts, Math.max(10, inner - visibleLength(weight) - 1), theme), { dim: true }), inner - visibleLength(weight)) + weight });
-    });
-
-    section('Ruled out');
-    if (excluded.length) for (const e of excluded) para(`Track ${e.track}: ${excludedText(e)}`);
-    else para('None yet. No tracks are announced or occupied for other trains departing within 20 minutes.');
-
-    const others = (train.top_alternatives || []).slice(1);
-    if (others.length) {
-      section('Other tracks');
-      for (const a of others) {
-        lines.push({ text: `Track ${String(a.track).padStart(2)}  ${meter(a.pct, 10, TIER.low.fg, theme, { estimate: true })} ${formatPct(a.pct)}` });
+  if (reasoning) {
+    collapsible('estimate', 'Estimate details', () => {
+      const { signals = [], excluded = [], reliability, equipment, approach, platform } = reasoning;
+      const lead = equipment ?? approach;
+      const pct = formatPct(train.confidence);
+      if (lead) {
+        const why = equipment
+          ? "because this train's equipment is already on that platform."
+          : approach.farEnd
+            ? "because this train's equipment is at the far end of that track."
+            : "because this train's equipment is approaching the platforms on a signal circuit that usually leads there.";
+        para(`Track ${track} has an estimated ${pct} chance ${why} Past track assignments below cover the rest.`);
+      } else {
+        const platformNote =
+          platform && platform.pct > train.confidence
+            ? ` Tracks ${platform.tracks.join(' and ')} share a platform: ${formatPct(platform.pct)} chance it's one of them.`
+            : '';
+        para(
+          `Track ${track} has an estimated ${pct} chance.${platformNote} PennAhead combines the past track assignments below, giving more weight to signals with more records, then rules out tracks that are announced for, occupied by, or more likely for other trains.`
+        );
       }
-    }
 
-    if (reliability) {
-      section('How reliable is this?');
-      const parts = [];
-      if (equipment && equipment.total > 0)
-        parts.push(`Equipment-based estimates matched the announced track on ${num(equipment.hits)} of ${num(equipment.total)} departures checked; the estimate uses that rate, adjusted slightly down while the sample is small.`);
-      if (approach?.farEnd)
-        parts.push(`Departures seen at the far end of a track left from that track on ${num(approach.hits)} of ${num(approach.total)} checked; the estimate uses that rate, adjusted down while the sample is small.`);
-      else if (approach)
-        parts.push(`Departures seen on ${approach.circuit} left from Track ${approach.track} on ${num(approach.hits)} of ${num(approach.total)} checked; the estimate uses that rate, adjusted down while the sample is small.`);
-      parts.push(
-        `${lead ? 'History-only estimates were tested' : 'Tested'} on ${reliability.heldOutPeriod} departures that were not used to build the model: the top pick was right ${reliability.top1Pct}% of the time and the right track was in the top three ${reliability.top3Pct}% of the time.${lead ? '' : ' Shown percentages track those real hit rates.'}`
-      );
-      para(parts.join(' '));
-    }
-  } else {
-    if (train.historical_stat) {
-      sub('Historical precedent');
-      para(train.historical_stat);
-    }
-    if (train.turnaround_inbound) {
+      if (equipment) {
+        gap();
+        sub('Equipment position');
+        para(
+          `NJ TRANSIT last reported this train's equipment on Track ${equipment.track} (signal circuit ${equipment.circuit}${equipment.observedAt ? `, ${equipment.observedAt}` : ''}); the circuit name identifies the platform. Trains almost always leave from the platform their equipment is on${equipment.total > 0 ? `: equipment-based estimates matched NJ TRANSIT's announced track on ${num(equipment.hits)} of ${num(equipment.total)} departures checked.` : '.'}`
+        );
+      } else if (approach?.farEnd) {
+        gap();
+        sub('Equipment position');
+        para(
+          `NJ TRANSIT reports this train's equipment on signal circuit ${approach.circuit}${approach.observedAt ? ` (${approach.observedAt})` : ''}, the far end of Track ${approach.track}. Departures whose equipment was there before the track was announced left from that track on ${num(approach.hits)} of ${num(approach.total)} departures checked.`
+        );
+      } else if (approach) {
+        gap();
+        sub('Equipment position');
+        para(
+          `NJ TRANSIT last reported this train's equipment on signal circuit ${approach.circuit}${approach.observedAt ? ` (${approach.observedAt})` : ''}, on its way to the platforms. Departures whose equipment was seen there before the track was announced left from Track ${approach.track} on ${num(approach.hits)} of ${num(approach.total)} departures checked.`
+        );
+      } else if (reasoning.equipmentConflict) {
+        const c = reasoning.equipmentConflict;
+        gap();
+        sub('Equipment position');
+        para(`This train's equipment is on Track ${c.track}, but that track is announced for ${whoLabel(c.operator, c.train_id)} (${c.dep_time}), so this estimate uses past track assignments instead.`);
+      }
+
       gap();
-      sub('Equipment turnaround');
-      para(train.turnaround_inbound);
-    }
-    if (train.constraints) {
+      sub(lead ? `Past track assignments for Track ${track}` : `Evidence for Track ${track}`);
+      const mw = Math.min(10, Math.max(4, inner - 40));
+      signals.forEach((sig, i) => {
+        if (i) gap();
+        const weight = `${meter(sig.weightPct, mw, TIER[tier].fg, theme)} ${style(`${String(sig.weightPct).padStart(3)}% weight`, { dim: true })}`;
+        const counts = `Track ${track} on ${num(sig.count)} of ${num(sig.total)} departures (${sig.total > 0 ? Math.round((sig.count / sig.total) * 100) : 0}%)`;
+        wrap(sig.label, inner).forEach((l) => lines.push({ text: l }));
+        lines.push({ text: padTo(style(truncate(counts, Math.max(10, inner - visibleLength(weight) - 1), theme), { dim: true }), inner - visibleLength(weight)) + weight });
+      });
+
       gap();
-      sub('Track availability');
-      para(train.constraints);
-    }
+      sub('Ruled out');
+      if (excluded.length) for (const e of excluded) para(`Track ${e.track}: ${excludedText(e)}`);
+      else para('None yet. No tracks are announced or occupied for other trains departing within 20 minutes.');
+
+      const others = (train.top_alternatives || []).slice(1);
+      if (others.length) {
+        gap();
+        sub('Other tracks');
+        for (const a of others) {
+          lines.push({ text: `Track ${String(a.track).padStart(2)}  ${meter(a.pct, 10, TIER.low.fg, theme, { estimate: true })} ${formatPct(a.pct)}` });
+        }
+      }
+
+      if (reliability) {
+        gap();
+        sub('How reliable is this?');
+        const parts = [];
+        if (equipment && equipment.total > 0)
+          parts.push(`Equipment-based estimates matched the announced track on ${num(equipment.hits)} of ${num(equipment.total)} departures checked; the estimate uses that rate, adjusted slightly down while the sample is small.`);
+        if (approach?.farEnd)
+          parts.push(`Departures seen at the far end of a track left from that track on ${num(approach.hits)} of ${num(approach.total)} checked; the estimate uses that rate, adjusted down while the sample is small.`);
+        else if (approach)
+          parts.push(`Departures seen on ${approach.circuit} left from Track ${approach.track} on ${num(approach.hits)} of ${num(approach.total)} checked; the estimate uses that rate, adjusted down while the sample is small.`);
+        parts.push(
+          `${lead ? 'History-only estimates were tested' : 'Tested'} on ${reliability.heldOutPeriod} departures that were not used to build the model: the top pick was right ${reliability.top1Pct}% of the time and the right track was in the top three ${reliability.top3Pct}% of the time.${lead ? '' : ' Shown percentages track those real hit rates.'}`
+        );
+        para(parts.join(' '));
+      }
+    });
   }
 
   if (!canceled && !later && track) {
-    section(`Easiest way to Track ${track}`);
-    directions(track).forEach((d, i) => {
-      if (i) gap();
-      para(d);
+    collapsible('access', 'Track access', () =>
+      directions(track).forEach((d, i) => {
+        if (i) gap();
+        para(d);
+      })
+    );
+  }
+
+  // Stops (from /api/stops; none = no section): Penn first, then the stops, in the tier's color.
+  // A delayed train shows each scheduled time plus the reported delay, with ~ as in the title
+  const stops = canceled ? null : opts.stops;
+  if (stops?.length) {
+    const delay = train.delay;
+    section('Stops');
+    lines[lines.length - 1].note = delay ? `~${delay.minutes} min late` : 'Scheduled';
+    const dotColor = later ? undefined : TIER[tier].fg;
+    const route = [{ station: 'New York Penn Station', time: train.dep_time, departed: false }, ...stops];
+    route.forEach((stop, i) => {
+      const end = i === 0 || i === route.length - 1;
+      const time = stop.time
+        ? delay
+          ? `~${formatClock(i === 0 ? delay.dep_time : addMinutes(stop.time, delay.minutes))}`
+          : formatClock(stop.time)
+        : '';
+      const dot = style(end ? g.stopEnd : g.stopMid, { fg: dotColor, dim: !dotColor });
+      const name = truncate(stop.station, Math.max(8, inner - 2 - visibleLength(time) - 1), theme);
+      const left = `${dot} ${style(name, { bold: end, dim: stop.departed })}`;
+      lines.push({ text: padTo(left, inner - visibleLength(time)) + style(time, { bold: end, dim: stop.departed }) });
     });
   }
 
@@ -762,7 +829,7 @@ function alertTitles(alert, theme) {
   const color = LINE_COLORS[alert.lines?.[0]] || AMBER;
   return {
     left: [style('ALERT', { fg: AMBER, bold: true }), `${style(g.dot, { fg: color })}${style(alert.tag || 'ALL', { bold: true })}`],
-    right: [style(alertTime(alert), { bold: true })],
+    right: [style(formatClock(alertTime(alert)), { bold: true })],
   };
 }
 
@@ -774,17 +841,19 @@ function trainTitles(train, theme, extra = {}) {
     `${style(g.dot, { fg: LINE_COLORS[train.line] })}${style(train.line, { bold: true })}`,
   ];
   if (extra.gone) left.push(style('no longer listed', { fg: RED }));
-  const when = train.delay ? `${train.dep_time} → ~${train.delay.dep_time}` : `${train.dep_time} · ${formatRelTime(train.rel_time).toLowerCase()}`;
+  const when = train.delay
+    ? `${formatClock(train.dep_time)} → ~${formatClock(train.delay.dep_time)}`
+    : `${formatClock(train.dep_time)} · ${formatRelTime(train.rel_time).toLowerCase()}`;
   const right = [style(when, { bold: true })];
   if (extra.countdown != null) right.push(style(`${theme.ascii ? 'next' : '↻'} ${extra.countdown}s`, { dim: true }));
   return { left, right };
 }
 
-/** One train's details, printed once (non-interactive) */
-export function renderTrain(train, theme, width) {
+/** One train's details, printed once (non-interactive): every section open, with its stops if given */
+export function renderTrain(train, theme, width, { stops = null } = {}) {
   const { left, right } = trainTitles(train, theme);
   const out = [borderLine(width, [theme.g.tl, theme.g.tr], left, right, theme), boxRow('', width, theme)];
-  for (const l of buildTrainBody(train, theme, width)) out.push(renderBodyLine(l, width, theme));
+  for (const l of buildTrainBody(train, theme, width, { open: true, stops })) out.push(renderBodyLine(l, width, theme));
   out.push(borderLine(width, [theme.g.bl, theme.g.br], [], [], theme));
   out.push(...footerLines(width, theme, INDEPENDENT_LINE));
   return theme.fold(out.join('\n'));
@@ -795,7 +864,7 @@ export function renderTrain(train, theme, width) {
 
 export const HELP_KEYS = [
   ['Moving', null],
-  ['j / k, ↓ / ↑', 'list: next / previous train; details: scroll'],
+  ['j / k, ↓ / ↑', 'list: next / previous train; details: move the cursor line'],
   ['gg / G', 'first / last'],
   ['Ctrl-d / Ctrl-u', 'half a page down / up'],
   ['Ctrl-f / Ctrl-b', 'a page down / up'],
@@ -804,6 +873,11 @@ export const HELP_KEYS = [
   ['h, ←, Esc, Tab', 'back to the list'],
   ['Ctrl-w h / l', 'list / details, as with vim windows'],
   ['J / K', 'next / previous train from the details'],
+  ['Sections', null],
+  ['d / t', 'open / close Estimate details / Track access (from either pane)'],
+  ['Enter, Space, za', 'open / close the section at the cursor'],
+  ['zR / zM', 'open / close all sections'],
+  ['] / [', 'next / previous section'],
   ['Filters', null],
   ['0', 'all lines'],
   ['1–5', 'NEC, NJCL, M&E, RARV, MOBO (toggle)'],
@@ -863,7 +937,129 @@ export function saveSeenAlerts(ids, file = seenAlertsFile()) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Updates: at most once a day, the public repo's version.json says whether a newer penn is out
+// (remembered in ~/.config/pennahead/update-check.json; PENNAHEAD_NO_UPDATE_CHECK=1 turns it off).
+// `penn --update` downloads the new file, checks it runs, then swaps it in.
+
+const UPDATE_EVERY_MS = 24 * 60 * 60 * 1000;
+export const updateCheckFile = () => join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'pennahead', 'update-check.json');
+
+/** 1 when a is newer than b, -1 when older, 0 when the same ("0.10.0" > "0.9.1") */
+export function compareVersions(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+async function fetchLatestVersion() {
+  const res = await fetch(`${RELEASE_URL}/version.json`, {
+    headers: { 'User-Agent': `PennAhead-CLI/${VERSION}` },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const { version } = await res.json();
+  if (!/^\d+\.\d+\.\d+$/.test(String(version))) throw new Error('no version');
+  return String(version);
+}
+
+/** The newer version, if one is out (checked at most once a day; quiet when offline), else null */
+export async function checkForUpdate({ file = updateCheckFile(), now = Date.now(), fetchLatest = fetchLatestVersion } = {}) {
+  if (process.env.PENNAHEAD_NO_UPDATE_CHECK) return null;
+  let saved = {};
+  try {
+    saved = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    // first run
+  }
+  let latest = saved.latest ?? null;
+  if (!(saved.checkedAt > now - UPDATE_EVERY_MS)) {
+    try {
+      latest = await fetchLatest();
+    } catch {
+      // offline or GitHub unreachable: try again tomorrow
+    }
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, JSON.stringify({ checkedAt: now, latest }));
+    } catch {
+      // read-only home: check again next start
+    }
+  }
+  return latest && compareVersions(latest, VERSION) > 0 ? latest : null;
+}
+
+/** penn --update: replace this file with the latest release (not a symlinked or development copy) */
+async function selfUpdate() {
+  const self = process.argv[1];
+  const fail = (msg) => {
+    console.error(`pennahead: ${msg}`);
+    process.exit(1);
+  };
+  let target;
+  try {
+    if (lstatSync(self).isSymbolicLink()) {
+      return fail(`${self} is a link to ${realpathSync(self)} (a development copy?). Update it with git, or install with the curl command in the README.`);
+    }
+    target = realpathSync(self);
+  } catch (err) {
+    return fail(`can't find this file: ${err.message}`);
+  }
+  let latest;
+  try {
+    latest = await fetchLatestVersion();
+  } catch (err) {
+    return fail(`couldn't check for updates: ${err.message}`);
+  }
+  if (compareVersions(latest, VERSION) <= 0) return console.log(`penn ${VERSION} is the latest.`);
+  let code;
+  try {
+    const res = await fetch(`${RELEASE_URL}/penn`, { headers: { 'User-Agent': `PennAhead-CLI/${VERSION}` }, signal: AbortSignal.timeout(20000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    code = await res.text();
+  } catch (err) {
+    return fail(`couldn't download penn ${latest}: ${err.message}`);
+  }
+  // Next to this file, checked before it replaces anything
+  const tmp = `${target}.update-${process.pid}`;
+  try {
+    writeFileSync(tmp, code, { mode: 0o755 });
+    chmodSync(tmp, 0o755);
+    const run = spawnSync(process.execPath, [tmp, '--version'], { encoding: 'utf8', timeout: 10000, env: { ...process.env, PENNAHEAD_NO_UPDATE_CHECK: '1' } });
+    if (run.status !== 0 || run.stdout.trim() !== latest) throw new Error(`the download didn't run as penn ${latest}`);
+    renameSync(tmp, target);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    return fail(`update failed, ${target} is unchanged: ${err.message}`);
+  }
+  try {
+    writeFileSync(updateCheckFile(), JSON.stringify({ checkedAt: Date.now(), latest }));
+  } catch {
+    // fine
+  }
+  console.log(`Updated penn ${VERSION} → ${latest}.`);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Data
+
+/** A train's stops after NY Penn from /api/stops ({ station, time, departed }[]), or null */
+export async function fetchStops(baseUrl, trainId, { timeoutMs = 10000 } = {}) {
+  try {
+    const res = await fetch(new URL(`/api/stops?train=${encodeURIComponent(trainId)}`, baseUrl), {
+      headers: { 'User-Agent': `PennAhead-CLI/${VERSION}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    return Array.isArray(body?.stops) ? body.stops : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function fetchBoard(baseUrl, { timeoutMs = 10000 } = {}) {
   const res = await fetch(new URL('/api/departures', baseUrl), {
@@ -910,6 +1106,9 @@ export function parseArgs(argv) {
       case '-1':
       case '--once':
         opts.once = true;
+        break;
+      case '--update':
+        opts.update = true;
         break;
       case '--json':
         opts.json = true;
@@ -975,6 +1174,7 @@ Options:
       --json             print the API's data (filtered) as JSON
   -i, --interval <s>     refresh every <s> seconds (at least ${MIN_INTERVAL_S})
       --url <url>        another PennAhead server (default ${DEFAULT_URL}, or $PENNAHEAD_URL)
+      --update           update penn to the latest version (it checks once a day and says so)
       --ascii            plain ASCII lines and meters
       --no-color         no colors (also NO_COLOR=1)
   -V, --version
@@ -1055,13 +1255,18 @@ async function runInteractive(opts) {
     selectedIndex: 0,
     scroll: 0,
     detailScroll: 0,
+    detailCursor: 0, // the highlighted line in the details (j / k), for Enter / za
+    cursorToSection: true, // put the cursor on the first section heading when a train opens
+    openSections: new Set(), // open sections (SECTIONS), kept while moving between trains
+    stops: new Map(), // trainKey → { stops, until, inFlight }: /api/stops, 5 min (1 min after a failure)
     helpScroll: 0,
     prompt: null, // { kind: '/' | ':', text }
     lastSearch: null,
     flash: null, // { text, until }
-    pending: null, // 'g' (gg) or 'w' (Ctrl-w h / l)
+    pending: null, // 'g' (gg), 'w' (Ctrl-w h / l) or 'z' (za, zR, zM)
     nextFetchAt: 0,
     wantTrain: opts.train || null,
+    update: null, // a newer penn version, from the daily check
   };
 
   const restore = () => out.write('\x1b[?25h\x1b[?1049l');
@@ -1106,7 +1311,11 @@ async function runInteractive(opts) {
     const list = items();
     if (!list.length) return;
     const i = Math.max(0, Math.min(list.length - 1, index));
-    if (list[i].key !== state.selectedKey) state.detailScroll = 0;
+    if (list[i].key !== state.selectedKey) {
+      state.detailScroll = 0;
+      state.detailCursor = 0;
+      state.cursorToSection = true;
+    }
     state.selectedIndex = i;
     state.selectedKey = list[i].key;
   }
@@ -1185,7 +1394,7 @@ async function runInteractive(opts) {
     const { lines, alerts } = buildBoardBody(data, { filters: state.filters, showAlerts: state.showAlerts, selectable: true, selectedKey: state.selectedKey }, theme, width);
     if (state.showAlerts && !state.loading) markAlertsSeen(alerts);
     const countdown = Math.max(0, Math.ceil((state.nextFetchAt - Date.now()) / 1000));
-    const b = boardBorders(data, { filters: state.filters, showAlerts: state.showAlerts, seen: state.seenAlerts, countdown, interactive: true, width }, theme, alerts);
+    const b = boardBorders(data, { filters: state.filters, showAlerts: state.showAlerts, seen: state.seenAlerts, countdown, interactive: true, width, update: state.update }, theme, alerts);
     const top = borderLine(width, [theme.g.tl, theme.g.tr], b.top, [], theme, color);
     const bottom = promptOrFlash(width, [theme.g.bl, theme.g.br], b.bottomLeft, b.bottomRight, color);
     // Keep the selected row in view
@@ -1209,7 +1418,7 @@ async function runInteractive(opts) {
     const train = item?.kind === 'train' ? item.train : null;
     const { style } = theme;
     const hints = focused
-      ? [style('j/k scroll', { dim: true }), style('J/K next', { dim: true }), style('h list', { dim: true })]
+      ? [style('j/k move', { dim: true }), style('⏎ open/close', { dim: true }), style('J/K train', { dim: true }), style('h list', { dim: true })]
       : [style('l details', { dim: true })];
     const bottomFor = () =>
       layout.twoCol
@@ -1218,7 +1427,7 @@ async function runInteractive(opts) {
     if (item?.kind === 'alert') {
       const { left, right } = alertTitles(item.alert, theme);
       const top = borderLine(width, [theme.g.tl, theme.g.tr], left, right, theme, color);
-      const f = box(width, height, top, buildAlertBody(item.alert, theme, width), state.detailScroll, bottomFor(), color);
+      const f = box(width, height, top, withCursor(buildAlertBody(item.alert, theme, width), height, focused), state.detailScroll, bottomFor(), color);
       state.detailScroll = f.scroll;
       layout.detail = f;
       return f.lines;
@@ -1232,10 +1441,68 @@ async function runInteractive(opts) {
     }
     const { left, right } = trainTitles(train, theme);
     const top = borderLine(width, [theme.g.tl, theme.g.tr], left, right, theme, color);
-    const f = box(width, height, top, buildTrainBody(train, theme, width), state.detailScroll, bottomFor(), color);
+    const body = buildTrainBody(train, theme, width, { open: state.openSections, stops: stopsFor(train), keys: true });
+    if (state.cursorToSection) {
+      const first = body.findIndex((l) => l.section);
+      state.detailCursor = first >= 0 ? first : 0;
+      state.cursorToSection = false;
+    }
+    if (state.pendingCursorSection) {
+      const at = body.findIndex((l) => l.section === state.pendingCursorSection);
+      if (at >= 0) state.detailCursor = at;
+      state.pendingCursorSection = null;
+    }
+    const f = box(width, height, top, withCursor(body, height, focused), state.detailScroll, bottomFor(), color);
     state.detailScroll = f.scroll;
-    layout.detail = f;
+    layout.detail = { ...f, body };
     return f.lines;
+  }
+
+  // The details' cursor line: kept in range and in view, highlighted while the details have focus
+  function withCursor(body, height, focused) {
+    state.detailCursor = Math.max(0, Math.min(body.length - 1, state.detailCursor));
+    const rows = Math.max(1, height - 3);
+    if (state.detailCursor < state.detailScroll) state.detailScroll = state.detailCursor;
+    if (state.detailCursor >= state.detailScroll + rows) state.detailScroll = state.detailCursor - rows + 1;
+    return focused ? body.map((l, i) => (i === state.detailCursor ? { ...l, selected: true } : l)) : body;
+  }
+
+  // A train's stops from /api/stops, fetched once per 5 min (1 min after a failure); none until then
+  function stopsFor(train) {
+    if (isCanceled(train)) return null;
+    const key = trainKey(train);
+    const cached = state.stops.get(key);
+    if (cached && (cached.inFlight || cached.until > Date.now())) return cached.stops;
+    const entry = { stops: cached?.stops ?? null, until: 0, inFlight: true };
+    state.stops.set(key, entry);
+    fetchStops(opts.url, train.train_id).then((stops) => {
+      state.stops.set(key, { stops, until: Date.now() + (stops ? 5 : 1) * 60 * 1000, inFlight: false });
+      draw();
+    });
+    return entry.stops;
+  }
+
+  // Open or close the section the cursor is on (its heading or its content), as vim's za
+  function toggleSection() {
+    const body = layout.detail?.body;
+    const line = body?.[state.detailCursor];
+    const key = line?.section ?? line?.inSection;
+    if (!key) return;
+    if (state.openSections.has(key)) {
+      state.openSections.delete(key);
+      state.detailCursor = body.findIndex((l) => l.section === key); // back to its heading
+    } else state.openSections.add(key);
+  }
+
+  // ] / [: the next or previous section heading
+  function jumpSection(direction) {
+    const body = layout.detail?.body ?? [];
+    for (let i = state.detailCursor + direction; i >= 0 && i < body.length; i += direction) {
+      if (body[i].divider) {
+        state.detailCursor = i;
+        return;
+      }
+    }
   }
 
   function draw() {
@@ -1332,8 +1599,17 @@ async function runInteractive(opts) {
       state.pending = null;
       if (pending === 'g' && key === 'g') {
         if (state.help) state.helpScroll = 0;
-        else if (state.focus === 'detail') state.detailScroll = 0;
+        else if (state.focus === 'detail') state.detailCursor = 0;
         else select(0);
+        return;
+      }
+      if (pending === 'z' && state.focus === 'detail') {
+        if (key === 'a') toggleSection();
+        else if (key === 'R') SECTIONS.forEach((k) => state.openSections.add(k));
+        else if (key === 'M') {
+          state.openSections.clear();
+          state.cursorToSection = true;
+        }
         return;
       }
       if (pending === 'w') {
@@ -1367,6 +1643,20 @@ async function runInteractive(opts) {
       case ':':
         state.prompt = { kind: key, text: '' };
         return;
+      case 'd':
+      case 't': {
+        // Open or close that section of the selected train's details, from either pane
+        const section = SECTION_KEYS[key];
+        if (selectedItem()?.kind !== 'train') return;
+        if (state.openSections.has(section)) state.openSections.delete(section);
+        else {
+          state.openSections.add(section);
+          if (!layout.twoCol) state.focus = 'detail'; // one column: show the details
+        }
+        // Keep the cursor on that section's heading
+        state.pendingCursorSection = section;
+        return;
+      }
       case 'r':
         refresh();
         return;
@@ -1422,15 +1712,22 @@ async function runInteractive(opts) {
     }
 
     if (state.focus === 'detail') {
+      // A cursor line, as in vim: j / k move it (the view follows); Enter, Space or za open or close
+      // the section it's in; ] / [ jump between sections
+      const move = (n) => (state.detailCursor = Math.max(0, state.detailCursor + n));
       if (['q', 'esc', 'h', 'left', 'backspace'].includes(key)) state.focus = 'list';
-      else if (key === 'j' || key === 'down') scrollPane('detailScroll', 'detail', 1);
-      else if (key === 'k' || key === 'up') scrollPane('detailScroll', 'detail', -1);
-      else if (key === 'ctrl-d') scrollPane('detailScroll', 'detail', half('detail'));
-      else if (key === 'ctrl-u') scrollPane('detailScroll', 'detail', -half('detail'));
-      else if (key === 'ctrl-f' || key === 'pagedown' || key === ' ') scrollPane('detailScroll', 'detail', page('detail'));
-      else if (key === 'ctrl-b' || key === 'pageup') scrollPane('detailScroll', 'detail', -page('detail'));
-      else if (key === 'G' || key === 'end') state.detailScroll = Number.MAX_SAFE_INTEGER;
-      else if (key === 'home') state.detailScroll = 0;
+      else if (key === 'j' || key === 'down') move(1);
+      else if (key === 'k' || key === 'up') move(-1);
+      else if (key === 'ctrl-d') move(half('detail'));
+      else if (key === 'ctrl-u') move(-half('detail'));
+      else if (key === 'ctrl-f' || key === 'pagedown') move(page('detail'));
+      else if (key === 'ctrl-b' || key === 'pageup') move(-page('detail'));
+      else if (key === 'G' || key === 'end') state.detailCursor = Number.MAX_SAFE_INTEGER;
+      else if (key === 'home') state.detailCursor = 0;
+      else if (key === 'enter' || key === ' ') toggleSection();
+      else if (key === 'z') state.pending = 'z';
+      else if (key === ']') jumpSection(1);
+      else if (key === '[') jumpSection(-1);
       return;
     }
 
@@ -1460,6 +1757,11 @@ async function runInteractive(opts) {
 
   draw();
   await refresh();
+  // A newer version, once a day at most: shown in the list's bottom border
+  checkForUpdate().then((v) => {
+    state.update = v;
+    if (v) draw();
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1475,9 +1777,17 @@ async function main() {
   }
   if (opts.help) return console.log(USAGE);
   if (opts.version) return console.log(VERSION);
+  if (opts.update) return selfUpdate();
 
   const interactive = !opts.once && !opts.json && process.stdout.isTTY && process.stdin.isTTY;
   if (interactive) return runInteractive(opts);
+
+  // Printed once: a newer version is mentioned on stderr, so piped output stays clean
+  const update = checkForUpdate().catch(() => null);
+  const noteUpdate = async () => {
+    const v = await update;
+    if (v) process.stderr.write(`penn ${v} is out (you have ${VERSION}): run penn --update\n`);
+  };
 
   let data;
   try {
@@ -1503,9 +1813,11 @@ async function main() {
       console.error(`pennahead: train #${opts.train} isn't on the board right now`);
       process.exit(1);
     }
-    return console.log(renderTrain(train, theme, width));
+    console.log(renderTrain(train, theme, width, { stops: isCanceled(train) ? null : await fetchStops(opts.url, train.train_id) }));
+    return noteUpdate();
   }
   console.log(renderBoard(data, { ...opts, seen: loadSeenAlerts() }, theme, width));
+  return noteUpdate();
 }
 
 const isMain = (() => {
