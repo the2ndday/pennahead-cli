@@ -1,0 +1,1517 @@
+#!/usr/bin/env node
+/**
+ * PennAhead in the terminal: the departure board and train details from pennahead.com's own API
+ * (/api/departures). Nothing is recalculated here; the CLI only shows what the site shows, with the
+ * same wording rules: "90%+", estimates marked *, NJ TRANSIT attribution and
+ * "may not be real time".
+ *
+ * Interactive (a terminal): a full-screen board in the style of btop (boxes with titles in the
+ * borders, ■ meters) with vim keys; press ? for help. Piped or --once: prints once and exits.
+ *
+ * Zero dependencies, Node 22+ (or 20.19+), macOS and Linux. A few display helpers are copied from
+ * the PennAhead app (formatPct, cleanDestination, the tiers, the 20-minute rule); the app's tests
+ * check that they still match.
+ */
+
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+export const VERSION = '0.1.0';
+const DEFAULT_URL = 'https://pennahead.com';
+const MIN_INTERVAL_S = 10; // the site's own board refreshes every 10 s per open tab
+const LINES = ['NEC', 'NJCL', 'M&E', 'RARV', 'MOBO'];
+const LINE_ALIASES = { NEC: 'NEC', NJCL: 'NJCL', 'M&E': 'M&E', ME: 'M&E', MNE: 'M&E', RARV: 'RARV', MOBO: 'MOBO' };
+
+// Same colors as the website's board
+const LINE_COLORS = { NEC: '#D0372D', NJCL: '#0EA5E9', 'M&E': '#22C55E', RARV: '#F97316', MOBO: '#C420E4' };
+const TIER = {
+  announced: { fg: '#22C55E', bg: '#047857' },
+  high: { fg: '#38BDF8', bg: '#0369A1' },
+  med: { fg: '#F59E0B', bg: '#B45309' },
+  low: { fg: '#FB7185', bg: '#BE123C' },
+};
+const RED = '#EF4444';
+const GREEN = '#22C55E';
+const AMBER = '#F59E0B';
+const ALERT_BADGE = '#DC2626'; // the new-alert count's red, as on the site
+const TRANSFER = '#EAB308'; // SEC and airport icons, yellow as on the site
+const BORDER = '#6D6D6D';
+const BORDER_FOCUS = '#A1A1AA'; // the pane the keys go to (two-column layout)
+const SELECT_BG = '#3F3F46';
+
+// The website's wording (its footer and train sheet)
+const DATA_LINE =
+  'Data obtained from NJ TRANSIT and served by PennAhead; LIRR tracks from the MTA, served by PennAhead; it may not be real time.';
+const INDEPENDENT_LINE =
+  'PennAhead is an independent service, not affiliated with or licensed by NJ TRANSIT® or Amtrak®. Tracks marked * are estimates and can be wrong; NJ TRANSIT can change a track at any time. Always check the official station displays before boarding.';
+
+// ---------------------------------------------------------------------------------------------
+// Display helpers copied from the PennAhead app (its tests keep them in step)
+
+/** The app's formatPct */
+export function formatPct(pct) {
+  return pct >= 90 ? '90%+' : `${pct}%`;
+}
+
+/** The app's cleanDestination */
+export function cleanDestination(dest) {
+  if (!dest) return '';
+  return dest
+    .replace(/&amp;#9992;?/gi, '')
+    .replace(/&#9992;?/gi, '')
+    .replace(/&amp;#x2708;?/gi, '')
+    .replace(/&#x2708;?/gi, '')
+    .replace(/✈/g, '')
+    .replace(/-?\s*SEC\b/gi, '')
+    .replace(/-?\s*EWR\b/gi, '')
+    .trim();
+}
+
+/** The app's formatRelTime */
+export function formatRelTime(relTime) {
+  if (!relTime) return '';
+  const t = relTime.trim().toUpperCase();
+  if (t.startsWith('IN ') || t === 'NOW' || t.endsWith(' AGO')) return t;
+  return `IN ${t}`;
+}
+
+/** The app's isMoreThan20Mins: estimates show from 20 min out (equipment sooner) */
+export function isMoreThan20Mins(train) {
+  if (train.confirmed_track) return false;
+  if (['equipment', 'approach', 'far_end'].includes(train.prediction_source)) return false;
+  if (typeof train.minutes_to_dep === 'number') return train.minutes_to_dep > 20;
+  const m = (train.rel_time || '').match(/in\s+(\d+)\s*m/i);
+  return m ? parseInt(m[1], 10) > 20 : false;
+}
+
+/** The app's track box tiers, by percentage (75 / 60) */
+export function tierOf(train) {
+  if (train.confirmed_track) return 'announced';
+  if (train.confidence >= 75) return 'high';
+  if (train.confidence >= 60) return 'med';
+  return 'low';
+}
+
+export function tierLabel(train) {
+  const tier = tierOf(train);
+  return tier === 'announced' ? 'ANNOUNCED' : `${tier.toUpperCase()} ${formatPct(train.confidence)}`;
+}
+
+const isCanceled = (t) => (t.status || '').toUpperCase().includes('CANCEL');
+const isDelayed = (t) => (t.status || '').toUpperCase().includes('DELAY');
+const trainKey = (t) => `${t.train_id}|${t.sched_dep_ms ?? t.dep_time}`;
+const whoLabel = (operator, id) =>
+  operator === 'amtrak' ? `Amtrak #${id}` : operator === 'lirr' ? `LIRR #${String(id).replace(/^L/, '')}` : `Train #${id}`;
+const num = (n) => Number(n).toLocaleString('en-US');
+
+// ---------------------------------------------------------------------------------------------
+// Terminal styling
+
+const ANSI_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;
+export const stripAnsi = (s) => s.replace(ANSI_RE, '');
+export const visibleLength = (s) => Array.from(stripAnsi(s)).length;
+const padTo = (s, w) => s + ' '.repeat(Math.max(0, w - visibleLength(s)));
+
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// Nearest xterm-256 color for terminals without truecolor (e.g. Apple Terminal)
+function to256([r, g, b]) {
+  const q = (v) => (v < 48 ? 0 : v < 115 ? 1 : Math.floor((v - 35) / 40));
+  return 16 + 36 * q(r) + 6 * q(g) + q(b);
+}
+
+export function makeTheme({ color = true, truecolor = true, ascii = false } = {}) {
+  const sgr = (hex, layer) => {
+    const rgb = hexToRgb(hex);
+    return truecolor ? `${layer};2;${rgb.join(';')}` : `${layer};5;${to256(rgb)}`;
+  };
+  const style = (text, o = {}) => {
+    if (!color || text === '') return text;
+    const codes = [];
+    if (o.bold) codes.push('1');
+    if (o.dim) codes.push('2');
+    if (o.strike) codes.push('9');
+    if (o.fg) codes.push(sgr(o.fg, 38));
+    if (o.bg) codes.push(sgr(o.bg, 48));
+    return codes.length ? `\x1b[${codes.join(';')}m${text}\x1b[0m` : text;
+  };
+  // A whole row on a background: re-apply it after every reset inside the row
+  const highlight = (line) => {
+    if (!color) return line;
+    const bg = `\x1b[${sgr(SELECT_BG, 48)}m`;
+    return bg + line.replaceAll('\x1b[0m', `\x1b[0m${bg}`) + '\x1b[0m';
+  };
+  const g = ascii
+    ? { tl: '+', tr: '+', bl: '+', br: '+', h: '-', v: '|', lt: '+', rt: '+', tL: '[', tR: ']', bL: '[', bR: ']', dot: 'o', on: '#', half: '#', off: '.', sec: 'SEC', ewr: 'EWR', sel: '>', ell: '~', cursor: '_' }
+    : { tl: '┌', tr: '┐', bl: '└', br: '┘', h: '─', v: '│', lt: '├', rt: '┤', tL: '┐', tR: '┌', bL: '┘', bR: '└', dot: '•', on: '⣿', half: '⡇', off: '⣀', sec: '⇄', ewr: '✈', sel: '▶', ell: '…', cursor: '▏' };
+  // ASCII mode: fold the few non-ASCII characters in the copy (superscript hints, dashes, ®)
+  const fold = (text) => (ascii ? text.replace(/[^\x00-\x7f]/g, (ch) => ASCII_FOLD[ch] ?? '?') : text);
+  return { color, ascii, style, highlight, g, fold };
+}
+
+const ASCII_FOLD = { '•': 'o', '⇄': 'SEC', '✈': 'EWR', 'ˢ': 's', 'ᵉ': 'e', 'ᵃ': 'a', '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '·': '-', '–': '-', '—': '-', '…': '...', '®': '(R)', '→': '->', '←': '<-', '↓': 'down', '↑': 'up', '’': "'", '↻': '' };
+
+// ¹nec ²njcl …: btop-style hotkey hints in box titles
+const SUP = ['⁰', '¹', '²', '³', '⁴', '⁵'];
+const SUP_S = 'ˢ';
+const SUP_E = 'ᵉ';
+const SUP_A = 'ᵃ';
+
+function truncate(text, w, theme) {
+  const chars = Array.from(text);
+  if (chars.length <= w) return text;
+  return w <= 1 ? chars.slice(0, w).join('') : chars.slice(0, w - 1).join('') + theme.g.ell;
+}
+
+/** Plain-text word wrap */
+export function wrap(text, width) {
+  const out = [];
+  for (const para of String(text).split('\n')) {
+    let line = '';
+    for (const word of para.split(/\s+/).filter(Boolean)) {
+      if (!line) line = word;
+      else if (visibleLength(line) + 1 + visibleLength(word) <= width) line += ` ${word}`;
+      else {
+        out.push(line);
+        line = word;
+      }
+      while (visibleLength(line) > width) {
+        out.push(line.slice(0, width));
+        line = line.slice(width);
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+// Bars in braille "dotted" blocks, like btop's graphs: ⣿ full, ⡇ half a cell, a dim ⣀ baseline for
+// the rest (ASCII: # and .)
+function meter(pct, width, fg, theme, { estimate = false } = {}) {
+  const { g } = theme;
+  // An estimate of 90% or more shows as "90%+", so its bar is full (no false precision at the top)
+  if (estimate && pct >= 90) pct = 100;
+  const halves = Math.max(0, Math.min(width * 2, Math.round((pct / 100) * width * 2)));
+  const full = Math.floor(halves / 2);
+  const half = theme.ascii ? 0 : halves % 2;
+  const filled = g.on.repeat(theme.ascii ? Math.round(halves / 2) : full) + (half ? g.half : '');
+  return theme.style(filled, { fg }) + theme.style(g.off.repeat(width - Array.from(filled).length), { dim: true });
+}
+
+/**
+ * A btop-style border line: corner, ─┐title┌─ segments on the left, fill, segments on the right.
+ * Segments that don't fit are dropped from the right end.
+ */
+function borderLine(width, [cl, cr], left = [], right = [], theme, color = BORDER) {
+  const { g, style } = theme;
+  const b = (s) => style(s, { fg: color });
+  // Titles open toward the box: ┐title┌ on the top edge, ┘title└ on the bottom
+  const bottom = cl === g.bl;
+  const seg = (s) => b(g.h + (bottom ? g.bL : g.tL)) + s + b(bottom ? g.bR : g.tR);
+  const L = left.filter(Boolean).map(seg);
+  const R = right.filter(Boolean).map(seg);
+  const fits = () => 2 + [...L, ...R].reduce((n, s) => n + visibleLength(s), 0) + 1 <= width;
+  while (!fits() && R.length) R.pop();
+  while (!fits() && L.length) L.pop();
+  const used = 2 + [...L, ...R].reduce((n, s) => n + visibleLength(s), 0);
+  const fill = Math.max(0, width - used - (R.length ? 1 : 0));
+  return b(cl) + L.join('') + b(g.h.repeat(fill)) + R.join('') + (R.length ? b(g.h) : '') + b(cr);
+}
+
+const boxRow = (content, width, theme, color = BORDER) => {
+  const v = theme.style(theme.g.v, { fg: color });
+  return `${v} ${padTo(content, width - 4)} ${v}`;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Board
+
+export function filterDepartures(departures, { lines = [], sec = false, ewr = false } = {}) {
+  return departures.filter(
+    (d) => (lines.length === 0 || lines.includes(d.line)) && (!sec || d.sec) && (!ewr || d.airport)
+  );
+}
+
+export function filterAlerts(alerts, { lines = [] } = {}) {
+  return (alerts || []).filter((a) => lines.length === 0 || !a.lines?.length || a.lines.some((l) => lines.includes(l)));
+}
+
+/** Imminent departures first (with estimates), then 20+ min away, as on the board */
+export function orderDepartures(departures) {
+  return [...departures.filter((d) => !isMoreThan20Mins(d)), ...departures.filter((d) => isMoreThan20Mins(d))];
+}
+
+// Column plan for a content width: optional columns drop as the terminal narrows
+function boardColumns(inner, { selectable }) {
+  const cols = { sel: selectable ? 1 : 0, time: 7, rel: 7, train: 6, line: 6, status: 10, track: 5, label: 9, meter: 10 };
+  const total = () => Object.values(cols).filter((w) => w > 0).reduce((n, w) => n + w + 1, -1);
+  const minDest = 20; // room for "Long Branch SEC EWR"; the bars give way first
+  // As space runs out: a shorter bar, then the status moves into the countdown's place, then the
+  // tier label goes; the bar stays (3 cells at the least)
+  const steps = [() => (cols.meter = 5), () => (cols.status = 0), () => (cols.label = 0), () => (cols.meter = 3)];
+  for (const step of steps) {
+    if (total() + 1 + minDest <= inner) break;
+    step();
+  }
+  // Without a status column the status takes the countdown's place, so give it room
+  if (!cols.status) cols.rel = 10;
+  cols.dest = Math.max(8, inner - total() - 1);
+  return cols;
+}
+
+function joinCols(cols, cells) {
+  // The ▶ marking the selected row sits at the right end, pointing to the details
+  const order = ['time', 'rel', 'train', 'line', 'dest', 'status', 'track', 'label', 'meter', 'sel'];
+  return order
+    .filter((k) => cols[k] > 0)
+    .map((k) => padTo(cells[k] ?? '', cols[k]))
+    .join(' ');
+}
+
+function boardHeader(cols, theme) {
+  const t = (s) => theme.style(s, { dim: true, bold: true });
+  const fit = (s, k) => t(truncate(s, cols[k], theme));
+  return joinCols(cols, {
+    time: t('TIME'),
+    rel: t('IN'),
+    train: t('TRAIN'),
+    line: t('LINE'),
+    dest: fit('DESTINATION', 'dest'),
+    status: t('STATUS'),
+    track: t('TRACK'),
+  });
+}
+
+function boardRow(train, cols, theme, { selected = false } = {}) {
+  const { style, g } = theme;
+  const canceled = isCanceled(train);
+  const later = isMoreThan20Mins(train);
+  const tier = tierOf(train);
+  const status = (train.status || '').toUpperCase();
+  const cell = (text, w, o) => style(truncate(text, w, theme), o);
+
+  let statusText = '';
+  let statusStyle = {};
+  if (status === 'BOARDING' || status === 'ALL ABOARD') [statusText, statusStyle] = [status, { fg: GREEN, bold: true }];
+  else if (canceled) [statusText, statusStyle] = ['CANCELED', { fg: RED, bold: true }];
+  else if (isDelayed(train)) [statusText, statusStyle] = [train.status.toUpperCase(), { fg: RED, bold: true }];
+  else if (train.status && status !== 'ON TIME') statusText = train.status.toUpperCase();
+
+  const time = train.dep_time.replace(/\s+/g, '');
+  // The countdown without "IN" (the column is headed IN): 12M, NOW, 1M AGO
+  let rel = train.delay ? `~${train.delay.dep_time.replace(/\s+/g, '')}` : formatRelTime(train.rel_time).replace(/^IN /, '');
+  // No status column on narrow terminals: the status takes the countdown's place
+  if (!cols.status && statusText) rel = statusText;
+
+  const track = canceled ? '' : later ? ' -- ' : ` ${String(train.confirmed_track || train.predicted_track || '--').padStart(2, '0')}${train.confirmed_track ? ' ' : '*'} `;
+  const trackCell = canceled
+    ? ''
+    : later
+      ? style(track, { dim: true })
+      : style(track, { bg: TIER[tier].bg, fg: '#FFFFFF', bold: true });
+  const showEstimate = !canceled && !later;
+
+  return joinCols(cols, {
+    sel: selected ? style(g.sel, { bold: true }) : '',
+    time: cell(time, cols.time, { bold: true, strike: Boolean(train.delay) }),
+    rel: cell(rel, cols.rel, !cols.status && statusText ? statusStyle : { bold: true }),
+    train: cell(`#${train.train_id}`, cols.train, { bold: true }),
+    line: style(g.dot, { fg: LINE_COLORS[train.line] }) + cell(train.line, cols.line - 1, { bold: true }),
+    dest: destCell(train, cols.dest, theme, selected),
+    status: cell(statusText, cols.status, statusStyle),
+    track: trackCell,
+    label: showEstimate ? cell(tierLabel(train), cols.label, { fg: TIER[tier].fg, bold: true }) : '',
+    meter: showEstimate ? meter(train.confirmed_track ? 100 : train.confidence, cols.meter, TIER[tier].fg, theme, { estimate: true }) : '',
+  });
+}
+
+// Destination with ⇄ (stops at Secaucus) and ✈ (Newark Airport) right beside it, like the site's
+// icons; the destination gives way first when space is short
+function destCell(train, width, theme, selected) {
+  const flags = [train.sec && theme.g.sec, train.airport && theme.g.ewr].filter(Boolean).join(' ');
+  const room = flags ? Math.max(4, width - flags.length - 1) : width;
+  const dest = truncate(cleanDestination(train.destination), room, theme);
+  const flagText = flags ? truncate(flags, Math.max(0, width - Array.from(dest).length - 1), theme) : '';
+  return theme.style(dest, { bold: selected }) + (flagText ? ` ${theme.style(flagText, { fg: TRANSFER, bold: true })}` : '');
+}
+
+const alertKey = (a) => `alert|${a.id}`;
+// "Posted Oct 1, 3:05 PM" → "3:05 PM" for the list (the details keep the full text)
+const alertTime = (a) => (a.timestamp || '').replace(/^Posted\s+/i, '').replace(/^[A-Z][a-z]{2} \d{1,2}, /, '');
+
+// One line per alert in the list: line dot, tag, time, the start of the text
+function alertRow(alert, inner, theme, { selectable, selected }) {
+  const { style, g } = theme;
+  const color = LINE_COLORS[alert.lines?.[0]] || AMBER;
+  const lead = `${style(g.dot, { fg: color })}${style(padTo(truncate(alert.tag || 'ALERT', 5, theme), 5), { bold: true, fg: AMBER })} ${style(padTo(alertTime(alert), 8), { dim: true })} `;
+  // The ▶ at the right end, as on train rows
+  const tail = selectable ? 2 : 0;
+  const room = Math.max(4, inner - visibleLength(lead) - tail);
+  const body = padTo(lead + style(truncate(alert.text.replace(/\s+/g, ' '), room, theme), { bold: selected }), inner - tail);
+  return selectable ? `${body} ${selected ? style(g.sel, { bold: true }) : ' '}` : body;
+}
+
+// Full alert text (printed with --alerts)
+function alertLines(alerts, inner, theme) {
+  const out = [];
+  for (const a of alerts) {
+    const color = LINE_COLORS[a.lines?.[0]] || AMBER;
+    out.push({ text: `${theme.style(theme.g.dot, { fg: color })}${theme.style(a.tag || 'Alert', { bold: true })}  ${theme.style(a.timestamp || '', { dim: true })}` });
+    for (const l of wrap(a.text, inner - 2)) out.push({ text: `  ${l}` });
+    if (a.url) out.push({ text: `  ${theme.style(truncate(a.url, inner - 2, theme), { dim: true })}` });
+  }
+  return out;
+}
+
+/**
+ * The list's selectable items: service alerts first (when shown), then trains (imminent, then 20+
+ * min away)
+ */
+export function listItems(data, filters, { showAlerts = false } = {}) {
+  const alerts = showAlerts ? filterAlerts(data.alerts, filters).map((alert) => ({ kind: 'alert', alert, key: alertKey(alert) })) : [];
+  const trains = orderDepartures(filterDepartures(data.departures || [], filters)).map((train) => ({ kind: 'train', train, key: trainKey(train) }));
+  return [...alerts, ...trains];
+}
+
+/**
+ * The board's body lines (inside the box): alert items (opts.showAlerts), then the trains. Item rows
+ * carry `item` (their index in `items`) and `selected`, so the interactive view can select and
+ * scroll; dividers carry `divider`. opts.expandAlerts prints each alert's full text instead of one
+ * line. `alerts` is every alert for the filtered lines, shown or not (for the count).
+ */
+export function buildBoardBody(data, opts, theme, width) {
+  const inner = width - 4;
+  const selectable = Boolean(opts.selectable);
+  const cols = boardColumns(inner, { selectable });
+  const items = listItems(data, opts.filters, { showAlerts: Boolean(opts.showAlerts || opts.expandAlerts) });
+  const allAlerts = filterAlerts(data.alerts, opts.filters);
+  const alerts = items.filter((i) => i.kind === 'alert').map((i) => i.alert);
+  const trains = items.filter((i) => i.kind === 'train').map((i) => i.train);
+  const lines = [];
+  const indent = 0; // headings start where the rows do (the ▶ is at the right end)
+  if (alerts.length) {
+    lines.push({ divider: 'Service alerts', indent });
+    if (opts.expandAlerts) lines.push(...alertLines(alerts, inner, theme));
+    else
+      items.forEach((it, i) => {
+        if (it.kind !== 'alert') return;
+        const selected = selectable && opts.selectedKey === it.key;
+        lines.push({ text: alertRow(it.alert, inner, theme, { selectable, selected }), item: i, selected });
+      });
+    lines.push({ text: '' }, { divider: 'Departures', indent });
+  }
+  // The column header stays pinned while scrolling, unless alerts sit above it
+  lines.push({ text: boardHeader(cols, theme), header: !alerts.length });
+  if (data.notice) {
+    for (const l of wrap(data.notice, inner)) lines.push({ text: l });
+    return { lines, trains, alerts: allAlerts, items };
+  }
+  if (!trains.length) {
+    lines.push({ text: data.isLive === false ? 'Departures are temporarily unavailable' : 'No matching departures' });
+    return { lines, trains, alerts: allAlerts, items };
+  }
+  const firstLater = trains.findIndex((t) => isMoreThan20Mins(t));
+  if (firstLater === 0) lines.push({ text: ' '.repeat(indent) + theme.style('No trains departing within 20 minutes', { dim: true }) });
+  trains.forEach((t, i) => {
+    // A blank line ends the section above (none when the list starts with these)
+    if (i === firstLater) lines.push(...(i > 0 ? [{ text: '' }] : []), { divider: '20+ min away', indent });
+    const selected = selectable && opts.selectedKey === trainKey(t);
+    lines.push({ text: boardRow(t, cols, theme, { selected }), item: alerts.length + i, selected });
+  });
+  return { lines, trains, alerts: allAlerts, items };
+}
+
+const nyTime = (iso, seconds = false) =>
+  new Date(iso || Date.now()).toLocaleTimeString('en-US', {
+    timeZone: 'America/New_York',
+    hour: 'numeric',
+    minute: '2-digit',
+    ...(seconds && { second: '2-digit' }),
+  });
+
+/**
+ * The list box's borders: filters on top (with key hints when interactive), PennAhead, alerts and
+ * the update time at the bottom
+ */
+function boardBorders(data, opts, theme, alerts) {
+  const { style } = theme;
+  const bottomLeft = [style('PennAhead', { bold: true }), style('NY Penn · NJ TRANSIT', { dim: true })];
+  const bottomRight = [];
+  if (data.error) bottomRight.push(style('offline', { fg: RED, bold: true }));
+  bottomRight.push(style(nyTime(data.fetchedAt, true), { bold: true }));
+  if (opts.countdown != null) bottomRight.push(style(`${theme.ascii ? 'next' : '↻'} ${opts.countdown}s`, { dim: true }));
+  if (opts.interactive) bottomRight.push(style('? help', { dim: true }));
+  // ALERTSᵃ beside the filters, lit while the alerts are shown. The count is red only while some
+  // alerts haven't been seen yet (opts.seen: alert IDs already shown), as on the site
+  const label = `ALERTS${opts.interactive ? SUP_A : ''}`;
+  const unseen = alerts.filter((a) => !opts.seen?.has(String(a.id))).length;
+  const count = !alerts.length
+    ? style(' 0', { dim: true })
+    : ` ${style(String(alerts.length), unseen ? { fg: ALERT_BADGE, bold: true } : { bold: true })}`;
+  const alertHint = (opts.showAlerts ? style(label, { bold: true }) : style(label, { dim: true })) + count;
+  // Dots and icons when the top border has room for them, plain labels otherwise
+  const borderLength = (segs) => 3 + segs.reduce((n, seg) => n + visibleLength(seg) + 3, 0);
+  let top = [...filterHints(opts.filters, theme, opts.interactive), alertHint];
+  if (opts.width && borderLength(top) > opts.width) top = [...filterHints(opts.filters, theme, opts.interactive, true), alertHint];
+  return { top, bottomLeft, bottomRight };
+}
+
+// ALL⁰ NEC¹ … SECˢ EWRᵉ when interactive (the keys), just the names when printed once
+// •NEC¹ with the line's colored dot, ⇄SECˢ / ✈EWRᵉ with the yellow icons; the key after the name. The dot and icon stay in
+// color; the label is bold when the filter is on and dim when off. compact drops dots and icons.
+function filterHints(filters, theme, keys = true, compact = false) {
+  const { style, g } = theme;
+  const hint = (key, mark, name, active) =>
+    `${compact || !mark ? '' : mark}${style(name, active ? { bold: true } : { dim: true })}${keys ? style(key, { dim: !active }) : ''}`;
+  const dot = (l) => style(g.dot, { fg: LINE_COLORS[l] });
+  const icon = (c) => style(c, { fg: TRANSFER, bold: true });
+  const lineHints = [
+    hint(SUP[0], '', 'ALL', filters.lines.length === 0),
+    ...LINES.map((l, i) => hint(SUP[i + 1], dot(l), l, filters.lines.includes(l))),
+  ].join(' ');
+  const flagHints = [hint(SUP_S, icon(g.sec), 'SEC', filters.sec), hint(SUP_E, icon(g.ewr), 'EWR', filters.ewr)].join(' ');
+  return [lineHints, flagHints];
+}
+
+function footerLines(width, theme, text = `${DATA_LINE} ${INDEPENDENT_LINE}`) {
+  return wrap(text, width).map((l) => theme.style(l, { dim: true }));
+}
+
+// Section headings are bold lines aligned with the text under them (box titles stay in the borders)
+function renderBodyLine(line, width, theme, color = BORDER) {
+  if (line.divider) return boxRow(' '.repeat(line.indent || 0) + theme.style(line.divider, { bold: true }), width, theme, color);
+  const row = boxRow(line.text, width, theme, color);
+  return line.selected ? highlightInner(row, theme, color) : row;
+}
+
+// Highlight between the box's side borders
+function highlightInner(row, theme, color = BORDER) {
+  if (!theme.color) return row;
+  const v = theme.style(theme.g.v, { fg: color });
+  const inner = row.slice(v.length, row.length - v.length);
+  return v + theme.highlight(inner) + v;
+}
+
+/** The whole board, printed once (non-interactive) */
+export function renderBoard(data, opts, theme, width) {
+  const { lines, alerts } = buildBoardBody(data, { ...opts, selectable: false, expandAlerts: opts.showAlerts }, theme, width);
+  const b = boardBorders(data, { ...opts, interactive: false, width }, theme, alerts);
+  const out = [borderLine(width, [theme.g.tl, theme.g.tr], b.top, [], theme), boxRow('', width, theme)];
+  for (const l of lines) out.push(renderBodyLine(l, width, theme));
+  out.push(borderLine(width, [theme.g.bl, theme.g.br], b.bottomLeft, b.bottomRight, theme));
+  if (data.error) out.push(theme.style(`Couldn't reach PennAhead: ${data.error}`, { fg: RED }));
+  out.push(...footerLines(width, theme));
+  return theme.fold(out.join('\n'));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Train details (mirrors the website's train sheet)
+
+function directions(track) {
+  const n = parseInt(track, 10);
+  if (n >= 1 && n <= 4) {
+    return [
+      `Primary access (~1–2 min walk): Head to Central Concourse Stairs ${track}E (7th Ave lower level).`,
+      "From Moynihan Train Hall: Tracks 1–4 can't be reached from there directly. Some riders get to the Central Concourse along another track's platform. If you do, use only platforms open to passengers, follow signs and staff, and keep clear of the platform edge and boarding passengers.",
+    ];
+  }
+  return ['Direct access (~1–2 min walk): Reachable directly from Moynihan Train Hall, West End Concourse, or Central Concourse.'];
+}
+
+function excludedText(e) {
+  if (e.reason === 'equipment') return `Train #${e.train_id}'s equipment is on it (departs ${e.dep_time})`;
+  if (e.reason === 'approach') return `Train #${e.train_id}'s equipment is approaching it (departs ${e.dep_time})`;
+  if (e.reason === 'occupied') return `other equipment (#${e.train_id}, not yet a listed departure) is on it`;
+  if (e.reason === 'predicted') return `more likely for Train #${e.train_id} (departs ${e.dep_time})`;
+  return `announced for ${whoLabel(e.operator, e.train_id)} (${e.dep_time})`;
+}
+
+// Big digits for the track number: 3×5-pixel glyphs drawn with half blocks, three rows tall
+const DIGIT_PIXELS = {
+  0: ['111', '101', '101', '101', '111'],
+  1: ['010', '110', '010', '010', '111'],
+  2: ['111', '001', '111', '100', '111'],
+  3: ['111', '001', '111', '001', '111'],
+  4: ['101', '101', '111', '001', '001'],
+  5: ['111', '100', '111', '001', '111'],
+  6: ['111', '100', '111', '101', '111'],
+  7: ['111', '001', '001', '001', '001'],
+  8: ['111', '101', '111', '101', '111'],
+  9: ['111', '101', '111', '001', '111'],
+  '-': ['000', '000', '111', '000', '000'],
+};
+
+export function bigDigits(text) {
+  const half = (top, bottom) => (top === '1' ? (bottom === '1' ? '█' : '▀') : bottom === '1' ? '▄' : ' ');
+  const rows = ['', '', ''];
+  Array.from(text).forEach((ch, n) => {
+    const px = DIGIT_PIXELS[ch] ?? DIGIT_PIXELS['-'];
+    const pairs = [[px[0], px[1]], [px[2], px[3]], [px[4], '000']];
+    pairs.forEach(([a, b], r) => (rows[r] += (n ? ' ' : '') + Array.from(a, (t, i) => half(t, b[i])).join('')));
+  });
+  return rows;
+}
+
+/** Body lines for one train (inside the box) */
+export function buildTrainBody(train, theme, width) {
+  const { style } = theme;
+  const inner = width - 4;
+  const lines = [];
+  const para = (text, o) => wrap(text, inner).forEach((l) => lines.push({ text: o ? style(l, o) : l }));
+  // A blank line, then the section's divider (sentence case, as in the site's train sheet)
+  const section = (title) => {
+    if (lines.length && lines[lines.length - 1].text !== '') lines.push({ text: '' });
+    lines.push({ divider: title });
+  };
+  const sub = (title) => lines.push({ text: style(title, { bold: true }) });
+  const gap = () => lines.push({ text: '' });
+
+  const canceled = isCanceled(train);
+  const later = isMoreThan20Mins(train);
+  const confirmed = Boolean(train.confirmed_track);
+  const track = (confirmed ? train.confirmed_track : train.predicted_track) || '';
+  const tier = tierOf(train);
+  const reasoning = !canceled && !later && !confirmed ? train.reasoning : undefined;
+
+  // Track and status
+  if (canceled) {
+    lines.push({ text: style('CANCELED', { fg: RED, bold: true }) });
+  } else if (later) {
+    lines.push({ text: `${style('TRACK', { dim: true, bold: true })}  ${style(' -- ', { dim: true })}` });
+  } else if (theme.ascii) {
+    const box = style(` ${String(track).padStart(2, '0')}${confirmed ? ' ' : '*'} `, { bg: TIER[tier].bg, fg: '#FFFFFF', bold: true });
+    lines.push({
+      text: `${style('TRACK', { dim: true, bold: true })}  ${box}  ${style(tierLabel(train), { fg: TIER[tier].fg, bold: true })}  ${meter(confirmed ? 100 : train.confidence, 10, TIER[tier].fg, theme, { estimate: true })}`,
+    });
+  } else {
+    // The track in big digits on the tier's color, like the site's track box; beside it what it is
+    // Half a row of color above the digits (▄ in the box color), matching the half row below them
+    const glyphs = bigDigits(String(track).padStart(2, '0'));
+    const boxW = Array.from(glyphs[0]).length + 2;
+    // TRACK, then the tier and its bar on one line
+    const side = [
+      '',
+      `${style('TRACK', { dim: true, bold: true })}${confirmed ? '' : style('  * estimate', { dim: true })}`,
+      `${style(tierLabel(train), { fg: TIER[tier].fg, bold: true })}  ${meter(confirmed ? 100 : train.confidence, 10, TIER[tier].fg, theme, { estimate: true })}`,
+      '',
+    ];
+    // (without color there's no box to extend, so a blank line)
+    lines.push({ text: theme.color ? `${style('▄'.repeat(boxW), { fg: TIER[tier].bg })}  ${side[0]}` : '' });
+    glyphs.forEach((row, i) => lines.push({ text: `${style(` ${row} `, { bg: TIER[tier].bg, fg: '#FFFFFF', bold: true })}  ${side[i + 1]}` }));
+    lines.push({ text: '' }); // a blank line before the status
+  }
+  const status = (train.status || '').toUpperCase();
+  const facts = [];
+  if (train.delay) facts.push(style(`Running about ${train.delay.minutes} min late, now ~${train.delay.dep_time}`, { fg: RED, bold: true }));
+  if (status && status !== 'ON TIME' && !canceled) facts.push(style(status, { bold: true, fg: status.includes('BOARD') ? GREEN : isDelayed(train) ? RED : undefined }));
+  if (train.sec) facts.push(`${style(theme.g.sec, { fg: TRANSFER, bold: true })}${style('Stops at Secaucus', { dim: true })}`);
+  if (train.airport) facts.push(`${style(theme.g.ewr, { fg: TRANSFER, bold: true })}${style('Newark Airport', { dim: true })}`);
+  if (facts.length) {
+    const joined = facts.join(style('  ·  ', { dim: true }));
+    // One line when it fits, else one fact per line
+    if (visibleLength(joined) <= inner) lines.push({ text: joined });
+    else facts.forEach((f) => lines.push({ text: visibleLength(f) <= inner ? f : truncate(stripAnsi(f), inner, theme) }));
+  }
+
+  section(reasoning ? 'How this estimate works' : 'Key factors');
+  if (canceled) para('This departure has been canceled by NJ Transit. No track will be assigned.');
+  else if (later) para(`Track prediction will be available 20 minutes before departure (${train.dep_time}).`);
+  else if (confirmed) para('Track announced by NJ Transit');
+  else if (reasoning) {
+    const { signals = [], excluded = [], reliability, equipment, approach, platform } = reasoning;
+    const lead = equipment ?? approach;
+    const pct = formatPct(train.confidence);
+    if (lead) {
+      const why = equipment
+        ? "because this train's equipment is already on that platform."
+        : approach.farEnd
+          ? "because this train's equipment is at the far end of that track."
+          : "because this train's equipment is approaching the platforms on a signal circuit that usually leads there.";
+      para(`Track ${track} has an estimated ${pct} chance ${why} Past track assignments below cover the rest.`);
+    } else {
+      const platformNote =
+        platform && platform.pct > train.confidence
+          ? ` Tracks ${platform.tracks.join(' and ')} share a platform: ${formatPct(platform.pct)} chance it's one of them.`
+          : '';
+      para(
+        `Track ${track} has an estimated ${pct} chance.${platformNote} PennAhead combines the past track assignments below, giving more weight to signals with more records, then rules out tracks that are announced for, occupied by, or more likely for other trains.`
+      );
+    }
+
+    if (equipment) {
+      gap();
+      sub('Equipment position');
+      para(
+        `NJ TRANSIT last reported this train's equipment on Track ${equipment.track} (signal circuit ${equipment.circuit}${equipment.observedAt ? `, ${equipment.observedAt}` : ''}); the circuit name identifies the platform. Trains almost always leave from the platform their equipment is on${equipment.total > 0 ? `: equipment-based estimates matched NJ TRANSIT's announced track on ${num(equipment.hits)} of ${num(equipment.total)} departures checked.` : '.'}`
+      );
+    } else if (approach?.farEnd) {
+      gap();
+      sub('Equipment position');
+      para(
+        `NJ TRANSIT reports this train's equipment on signal circuit ${approach.circuit}${approach.observedAt ? ` (${approach.observedAt})` : ''}, the far end of Track ${approach.track}. Departures whose equipment was there before the track was announced left from that track on ${num(approach.hits)} of ${num(approach.total)} departures checked.`
+      );
+    } else if (approach) {
+      gap();
+      sub('Equipment position');
+      para(
+        `NJ TRANSIT last reported this train's equipment on signal circuit ${approach.circuit}${approach.observedAt ? ` (${approach.observedAt})` : ''}, on its way to the platforms. Departures whose equipment was seen there before the track was announced left from Track ${approach.track} on ${num(approach.hits)} of ${num(approach.total)} departures checked.`
+      );
+    } else if (reasoning.equipmentConflict) {
+      const c = reasoning.equipmentConflict;
+      gap();
+      sub('Equipment position');
+      para(`This train's equipment is on Track ${c.track}, but that track is announced for ${whoLabel(c.operator, c.train_id)} (${c.dep_time}), so this estimate uses past track assignments instead.`);
+    }
+
+    section(lead ? `Past track assignments for Track ${track}` : `Evidence for Track ${track}`);
+    const mw = Math.min(10, Math.max(4, inner - 40));
+    signals.forEach((s, i) => {
+      if (i) gap();
+      const weight = `${meter(s.weightPct, mw, TIER[tier].fg, theme)} ${style(`${String(s.weightPct).padStart(3)}% weight`, { dim: true })}`;
+      const counts = `Track ${track} on ${num(s.count)} of ${num(s.total)} departures (${s.total > 0 ? Math.round((s.count / s.total) * 100) : 0}%)`;
+      wrap(s.label, inner).forEach((l) => lines.push({ text: style(l, { bold: true }) }));
+      lines.push({ text: padTo(style(truncate(counts, Math.max(10, inner - visibleLength(weight) - 1), theme), { dim: true }), inner - visibleLength(weight)) + weight });
+    });
+
+    section('Ruled out');
+    if (excluded.length) for (const e of excluded) para(`Track ${e.track}: ${excludedText(e)}`);
+    else para('None yet. No tracks are announced or occupied for other trains departing within 20 minutes.');
+
+    const others = (train.top_alternatives || []).slice(1);
+    if (others.length) {
+      section('Other tracks');
+      for (const a of others) {
+        lines.push({ text: `Track ${String(a.track).padStart(2)}  ${meter(a.pct, 10, TIER.low.fg, theme, { estimate: true })} ${formatPct(a.pct)}` });
+      }
+    }
+
+    if (reliability) {
+      section('How reliable is this?');
+      const parts = [];
+      if (equipment && equipment.total > 0)
+        parts.push(`Equipment-based estimates matched the announced track on ${num(equipment.hits)} of ${num(equipment.total)} departures checked; the estimate uses that rate, adjusted slightly down while the sample is small.`);
+      if (approach?.farEnd)
+        parts.push(`Departures seen at the far end of a track left from that track on ${num(approach.hits)} of ${num(approach.total)} checked; the estimate uses that rate, adjusted down while the sample is small.`);
+      else if (approach)
+        parts.push(`Departures seen on ${approach.circuit} left from Track ${approach.track} on ${num(approach.hits)} of ${num(approach.total)} checked; the estimate uses that rate, adjusted down while the sample is small.`);
+      parts.push(
+        `${lead ? 'History-only estimates were tested' : 'Tested'} on ${reliability.heldOutPeriod} departures that were not used to build the model: the top pick was right ${reliability.top1Pct}% of the time and the right track was in the top three ${reliability.top3Pct}% of the time.${lead ? '' : ' Shown percentages track those real hit rates.'}`
+      );
+      para(parts.join(' '));
+    }
+  } else {
+    if (train.historical_stat) {
+      sub('Historical precedent');
+      para(train.historical_stat);
+    }
+    if (train.turnaround_inbound) {
+      gap();
+      sub('Equipment turnaround');
+      para(train.turnaround_inbound);
+    }
+    if (train.constraints) {
+      gap();
+      sub('Track availability');
+      para(train.constraints);
+    }
+  }
+
+  if (!canceled && !later && track) {
+    section(`Easiest way to Track ${track}`);
+    directions(track).forEach((d, i) => {
+      if (i) gap();
+      para(d);
+    });
+  }
+
+  section('Data');
+  para(
+    `${DATA_LINE} ${train.reasoning ? `Historical data through ${train.reasoning.dataThrough}, collected mostly during the evening peak. ` : ''}Estimates are for planning only; NJ TRANSIT dispatchers assign the final track.`,
+    { dim: true }
+  );
+  return lines;
+}
+
+/** Body lines for one service alert (the right column when an alert is selected) */
+export function buildAlertBody(alert, theme, width) {
+  const inner = width - 4;
+  const lines = [];
+  const para = (text, o) => wrap(text, inner).forEach((l) => lines.push({ text: o ? theme.style(l, o) : l }));
+  const section = (title) => lines.push({ text: '' }, { divider: title });
+  const lineNames = alert.lines?.length ? alert.lines.join(', ') : 'All lines';
+  lines.push({ text: `${theme.style('SERVICE ALERT', { fg: AMBER, bold: true })}  ${theme.style(lineNames, { bold: true })}` });
+  if (alert.timestamp) lines.push({ text: theme.style(alert.timestamp, { dim: true }) });
+  section('Alert');
+  para(alert.text);
+  if (alert.url) {
+    section('More');
+    para(alert.url, { dim: true });
+  }
+  section('Data');
+  para(`Service alerts from NJ TRANSIT. ${DATA_LINE}`, { dim: true });
+  return lines;
+}
+
+function alertTitles(alert, theme) {
+  const { style, g } = theme;
+  const color = LINE_COLORS[alert.lines?.[0]] || AMBER;
+  return {
+    left: [style('ALERT', { fg: AMBER, bold: true }), `${style(g.dot, { fg: color })}${style(alert.tag || 'ALL', { bold: true })}`],
+    right: [style(alertTime(alert), { bold: true })],
+  };
+}
+
+function trainTitles(train, theme, extra = {}) {
+  const { style, g } = theme;
+  const left = [
+    style(`#${train.train_id}`, { bold: true }),
+    style(cleanDestination(train.destination), { bold: true }),
+    `${style(g.dot, { fg: LINE_COLORS[train.line] })}${style(train.line, { bold: true })}`,
+  ];
+  if (extra.gone) left.push(style('no longer listed', { fg: RED }));
+  const when = train.delay ? `${train.dep_time} → ~${train.delay.dep_time}` : `${train.dep_time} · ${formatRelTime(train.rel_time).toLowerCase()}`;
+  const right = [style(when, { bold: true })];
+  if (extra.countdown != null) right.push(style(`${theme.ascii ? 'next' : '↻'} ${extra.countdown}s`, { dim: true }));
+  return { left, right };
+}
+
+/** One train's details, printed once (non-interactive) */
+export function renderTrain(train, theme, width) {
+  const { left, right } = trainTitles(train, theme);
+  const out = [borderLine(width, [theme.g.tl, theme.g.tr], left, right, theme), boxRow('', width, theme)];
+  for (const l of buildTrainBody(train, theme, width)) out.push(renderBodyLine(l, width, theme));
+  out.push(borderLine(width, [theme.g.bl, theme.g.br], [], [], theme));
+  out.push(...footerLines(width, theme, INDEPENDENT_LINE));
+  return theme.fold(out.join('\n'));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Help
+
+export const HELP_KEYS = [
+  ['Moving', null],
+  ['j / k, ↓ / ↑', 'list: next / previous train; details: scroll'],
+  ['gg / G', 'first / last'],
+  ['Ctrl-d / Ctrl-u', 'half a page down / up'],
+  ['Ctrl-f / Ctrl-b', 'a page down / up'],
+  ['Panes', null],
+  ['Enter, l, →, Tab', 'to the details (on a narrow terminal: open them)'],
+  ['h, ←, Esc, Tab', 'back to the list'],
+  ['Ctrl-w h / l', 'list / details, as with vim windows'],
+  ['J / K', 'next / previous train from the details'],
+  ['Filters', null],
+  ['0', 'all lines'],
+  ['1–5', 'NEC, NJCL, M&E, RARV, MOBO (toggle)'],
+  ['s / e', 'only trains stopping at Secaucus (⇄) / Newark Airport (✈)'],
+  ['a', 'show / hide the service alerts above the trains (the count is red while some are new)'],
+  ['Search and commands', null],
+  ['/text', 'find a train number or destination'],
+  ['n / N', 'next / previous match'],
+  [':q', 'quit  (:3861 opens train #3861)'],
+  ['Other', null],
+  ['r', 'refresh now (it refreshes on its own every 10 s)'],
+  ['?', 'this help'],
+  ['q, Ctrl-c', 'quit'],
+];
+
+function buildHelpBody(theme, width) {
+  const inner = width - 4;
+  const lines = [];
+  for (const [key, what] of HELP_KEYS) {
+    if (what === null) {
+      if (lines.length) lines.push({ text: '' });
+      lines.push({ divider: key });
+      continue;
+    }
+    const k = theme.style(padTo(key, 18), { bold: true });
+    wrap(what, Math.max(10, inner - 19)).forEach((w, i) => lines.push({ text: `${i ? ' '.repeat(18) : k} ${w}` }));
+  }
+  lines.push({ text: '' }, { divider: 'About' });
+  wrap(`PennAhead CLI ${VERSION}. Reads ${DEFAULT_URL}; nothing is recalculated in the terminal.`, inner).forEach((l) =>
+    lines.push({ text: theme.style(l, { dim: true }) })
+  );
+  return lines;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Seen alerts: kept in ~/.config/pennahead (or $XDG_CONFIG_HOME) like the site's browser storage,
+// so the alert count isn't red again on every start. Best effort: without the file it's in memory.
+
+export const seenAlertsFile = () => join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'pennahead', 'seen-alerts.json');
+
+export function loadSeenAlerts(file = seenAlertsFile()) {
+  try {
+    const ids = JSON.parse(readFileSync(file, 'utf8'));
+    return new Set(Array.isArray(ids) ? ids.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveSeenAlerts(ids, file = seenAlertsFile()) {
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify([...ids]));
+  } catch {
+    // read-only home or no permission: keep it in memory
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Data
+
+export async function fetchBoard(baseUrl, { timeoutMs = 10000 } = {}) {
+  const res = await fetch(new URL('/api/departures', baseUrl), {
+    headers: { 'User-Agent': `PennAhead-CLI/${VERSION}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    // handled below
+  }
+  if (body?.source === 'coming_soon') {
+    return { departures: [], alerts: [], isLive: false, fetchedAt: body.fetchedAt, notice: "PennAhead isn't open yet. Departures show here once it launches." };
+  }
+  if (!res.ok || !body) throw new Error(`HTTP ${res.status}`);
+  return body;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Arguments
+
+export function parseArgs(argv) {
+  const opts = { filters: { lines: [], sec: false, ewr: false }, url: process.env.PENNAHEAD_URL || DEFAULT_URL, interval: MIN_INTERVAL_S };
+  const take = (i, name) => {
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith('-')) throw new Error(`${name} needs a value`);
+    return v;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    let a = argv[i];
+    let inline;
+    if (a.startsWith('--') && a.includes('=')) [a, inline] = [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)];
+    const value = (name) => (inline !== undefined ? inline : take(i++, name));
+    switch (a) {
+      case '-h':
+      case '--help':
+        opts.help = true;
+        break;
+      case '-V':
+      case '--version':
+        opts.version = true;
+        break;
+      case '-1':
+      case '--once':
+        opts.once = true;
+        break;
+      case '--json':
+        opts.json = true;
+        break;
+      case '-a':
+      case '--alerts':
+        opts.showAlerts = true;
+        break;
+      case '--sec':
+        opts.filters.sec = true;
+        break;
+      case '--ewr':
+        opts.filters.ewr = true;
+        break;
+      case '--ascii':
+        opts.ascii = true;
+        break;
+      case '--no-color':
+        opts.color = false;
+        break;
+      case '--color':
+        opts.color = true;
+        break;
+      case '-l':
+      case '--line':
+        for (const l of value('--line').split(',')) {
+          const line = LINE_ALIASES[l.trim().toUpperCase()];
+          if (!line) throw new Error(`Unknown line "${l}" (use NEC, NJCL, M&E, RARV or MOBO)`);
+          if (!opts.filters.lines.includes(line)) opts.filters.lines.push(line);
+        }
+        break;
+      case '--url':
+        opts.url = value('--url');
+        break;
+      case '-i':
+      case '--interval': {
+        const n = Number(value('--interval'));
+        if (!Number.isFinite(n)) throw new Error('--interval needs a number of seconds');
+        opts.interval = Math.max(MIN_INTERVAL_S, Math.round(n));
+        break;
+      }
+      default:
+        if (/^#?\w?\d+$/.test(a)) opts.train = a.replace(/^#/, '');
+        else throw new Error(`Unknown option "${a}" (see --help)`);
+    }
+  }
+  return opts;
+}
+
+const USAGE = `PennAhead ${VERSION}: NJ TRANSIT track estimates at New York Penn Station, in the terminal.
+
+Usage: pennahead [train] [options]
+
+  pennahead              the departure board (full screen in a terminal; press ? for keys)
+  pennahead 3861         train #3861's details
+  pennahead -1 -l nec    print the NEC board once and exit
+
+Options:
+  -l, --line <lines>     NEC, NJCL, M&E (or ME), RARV, MOBO; comma-separated
+      --sec, --ewr       only trains stopping at Secaucus / Newark Airport
+  -a, --alerts           print the service alerts' full text (with --once)
+  -1, --once             print once and exit (the default when output isn't a terminal)
+      --json             print the API's data (filtered) as JSON
+  -i, --interval <s>     refresh every <s> seconds (at least ${MIN_INTERVAL_S})
+      --url <url>        another PennAhead server (default ${DEFAULT_URL}, or $PENNAHEAD_URL)
+      --ascii            plain ASCII lines and meters
+      --no-color         no colors (also NO_COLOR=1)
+  -V, --version
+  -h, --help
+
+${DATA_LINE}
+${INDEPENDENT_LINE}`;
+
+// ---------------------------------------------------------------------------------------------
+// Interactive view
+
+function detectTheme(opts, stream) {
+  const env = process.env;
+  const color = opts.color ?? (env.NO_COLOR ? false : env.FORCE_COLOR ? true : Boolean(stream.isTTY));
+  const truecolor =
+    /truecolor|24bit/i.test(env.COLORTERM || '') || ['iTerm.app', 'WezTerm', 'vscode', 'ghostty'].includes(env.TERM_PROGRAM || '');
+  const locale = env.LC_ALL || env.LC_CTYPE || env.LANG || '';
+  const ascii = opts.ascii || (locale !== '' && !/utf-?8/i.test(locale)) || env.TERM === 'linux';
+  return makeTheme({ color, truecolor, ascii });
+}
+
+const termWidth = (stream) => Math.max(48, Math.min(stream.columns || 100, 140));
+
+// Keys from raw stdin: one chunk can hold several keys
+export function parseKeys(chunk) {
+  const keys = [];
+  const map = {
+    '\x1b[A': 'up', '\x1bOA': 'up', '\x1b[B': 'down', '\x1bOB': 'down', '\x1b[C': 'right', '\x1bOC': 'right',
+    '\x1b[D': 'left', '\x1bOD': 'left', '\x1b[5~': 'pageup', '\x1b[6~': 'pagedown', '\x1b[H': 'home', '\x1b[F': 'end',
+    '\x1b[1~': 'home', '\x1b[4~': 'end', '\x1bOH': 'home', '\x1bOF': 'end',
+  };
+  let i = 0;
+  while (i < chunk.length) {
+    const rest = chunk.slice(i);
+    const seq = Object.keys(map).find((s) => rest.startsWith(s));
+    if (seq) {
+      keys.push(map[seq]);
+      i += seq.length;
+      continue;
+    }
+    if (rest.startsWith('\x1b[')) {
+      // Unknown CSI sequence: skip it
+      const m = rest.match(/^\x1b\[[0-9;]*[~A-Za-z]/);
+      i += m ? m[0].length : 2;
+      continue;
+    }
+    const ch = chunk[i];
+    i += 1;
+    if (ch === '\x1b') keys.push('esc');
+    else if (ch === '\r' || ch === '\n') keys.push('enter');
+    else if (ch === '\x7f' || ch === '\b') keys.push('backspace');
+    else if (ch === '\x03') keys.push('ctrl-c');
+    else if (ch === '\x04') keys.push('ctrl-d');
+    else if (ch === '\x15') keys.push('ctrl-u');
+    else if (ch === '\x06') keys.push('ctrl-f');
+    else if (ch === '\x02') keys.push('ctrl-b');
+    else if (ch === '\t') keys.push('tab');
+    else if (ch === '\x17') keys.push('ctrl-w');
+    else if (ch >= ' ') keys.push(ch);
+  }
+  return keys;
+}
+
+async function runInteractive(opts) {
+  const out = process.stdout;
+  const stdin = process.stdin;
+  const theme = detectTheme(opts, out);
+  const state = {
+    help: false,
+    focus: 'list', // list | detail: where j/k go (and, on a narrow terminal, which pane shows)
+    data: { departures: [], alerts: [], fetchedAt: null },
+    loading: true,
+    filters: opts.filters,
+    showAlerts: Boolean(opts.showAlerts), // alert rows above the trains (a toggles)
+    seenAlerts: loadSeenAlerts(), // alert IDs already shown: the count's red badge clears
+    selectedKey: null,
+    selectedIndex: 0,
+    scroll: 0,
+    detailScroll: 0,
+    helpScroll: 0,
+    prompt: null, // { kind: '/' | ':', text }
+    lastSearch: null,
+    flash: null, // { text, until }
+    pending: null, // 'g' (gg) or 'w' (Ctrl-w h / l)
+    nextFetchAt: 0,
+    wantTrain: opts.train || null,
+  };
+
+  const restore = () => out.write('\x1b[?25h\x1b[?1049l');
+  const quit = (code = 0) => {
+    clearInterval(tick);
+    restore();
+    if (stdin.isTTY) stdin.setRawMode(false);
+    process.exit(code);
+  };
+  process.on('SIGTERM', () => quit(0));
+  process.on('uncaughtException', (err) => {
+    restore();
+    console.error(err);
+    process.exit(1);
+  });
+  out.write('\x1b[?1049h\x1b[?25l');
+  stdin.setRawMode(true);
+  stdin.setEncoding('utf8');
+  stdin.resume();
+
+  // The list's items: service alerts, then trains. Selection follows the item's key across refreshes
+  const items = () => listItems(state.data, state.filters, { showAlerts: state.showAlerts });
+  const flash = (text) => (state.flash = { text, until: Date.now() + 2500 });
+  const selectedItem = () => items()[state.selectedIndex];
+  const firstTrainIndex = (list) => Math.max(0, list.findIndex((i) => i.kind === 'train'));
+
+  function syncSelection() {
+    const list = items();
+    if (!list.length) {
+      state.selectedIndex = 0;
+      state.selectedKey = null;
+      return list;
+    }
+    const byKey = state.selectedKey ? list.findIndex((i) => i.key === state.selectedKey) : -1;
+    // Nothing selected yet: the first train (its details show on the right)
+    state.selectedIndex = byKey >= 0 ? byKey : state.selectedKey ? Math.min(state.selectedIndex, list.length - 1) : firstTrainIndex(list);
+    state.selectedKey = list[state.selectedIndex].key;
+    return list;
+  }
+
+  function select(index) {
+    const list = items();
+    if (!list.length) return;
+    const i = Math.max(0, Math.min(list.length - 1, index));
+    if (list[i].key !== state.selectedKey) state.detailScroll = 0;
+    state.selectedIndex = i;
+    state.selectedKey = list[i].key;
+  }
+
+  // Select a train by number (from the command line or :3861), clearing filters that hide it
+  function goToTrain(id) {
+    const t = (state.data.departures || []).find((d) => String(d.train_id) === String(id));
+    if (!t) return flash(`Train #${id} isn't on the board`);
+    if (!items().some((i) => i.key === trainKey(t))) state.filters = { lines: [], sec: false, ewr: false };
+    select(items().findIndex((i) => i.key === trainKey(t)));
+    state.focus = 'detail';
+  }
+
+  async function refresh() {
+    state.nextFetchAt = Date.now() + opts.interval * 1000;
+    try {
+      state.data = await fetchBoard(opts.url);
+      state.loading = false;
+      if (state.wantTrain) {
+        goToTrain(state.wantTrain);
+        state.wantTrain = null;
+      }
+    } catch (err) {
+      state.loading = false;
+      state.data = { ...state.data, error: err?.name === 'TimeoutError' ? 'timed out' : err?.message || String(err) };
+    }
+    draw();
+  }
+
+  // A box: top border, a blank line, body lines through a viewport (pinned header lines stay),
+  // bottom border
+  function box(width, height, top, body, scroll, bottom, color) {
+    const viewH = Math.max(1, height - 3);
+    const sticky = body.filter((l) => l.header);
+    const scrollable = body.filter((l) => !l.header);
+    const rows = Math.max(1, viewH - sticky.length);
+    const maxScroll = Math.max(0, scrollable.length - rows);
+    const s = Math.max(0, Math.min(scroll, maxScroll));
+    const lines = [top, boxRow('', width, theme, color), ...[...sticky, ...scrollable.slice(s, s + rows)].map((l) => renderBodyLine(l, width, theme, color))];
+    while (lines.length < viewH + 2) lines.push(boxRow('', width, theme, color));
+    // Scroll position on the right border, like a scrollbar thumb
+    if (maxScroll > 0 && !theme.ascii) {
+      const thumb = 2 + sticky.length + Math.round((s / maxScroll) * (rows - 1));
+      lines[thumb] = lines[thumb].replace(/│((?:\x1b\[0m)?)$/, `${theme.style('┃', { fg: '#D4D4D8' })}$1`);
+    }
+    lines.push(bottom);
+    return { lines: lines.slice(0, height), scroll: s, maxScroll, rows };
+  }
+
+  function promptOrFlash(width, corners, fallbackLeft, fallbackRight, color) {
+    const { style, g } = theme;
+    if (state.prompt) {
+      return borderLine(width, corners, [style(`${state.prompt.kind}${state.prompt.text}`, { bold: true }) + style(g.cursor, { dim: true })], [], theme, color);
+    }
+    if (state.flash && Date.now() < state.flash.until) {
+      return borderLine(width, corners, [style(state.flash.text, { fg: AMBER, bold: true })], [], theme, color);
+    }
+    return borderLine(width, corners, fallbackLeft, fallbackRight, theme, color);
+  }
+
+  let layout = { list: { rows: 10, maxScroll: 0 }, detail: { rows: 10, maxScroll: 0 }, help: { rows: 10, maxScroll: 0 }, twoCol: false };
+
+  // Alerts on screen count as seen; IDs no longer in the feed are dropped so the file stays small
+  function markAlertsSeen(alerts) {
+    const seen = state.seenAlerts;
+    const current = new Set((state.data.alerts || []).map((a) => String(a.id)));
+    let changed = false;
+    for (const id of [...seen]) if (!state.loading && !current.has(id)) changed = seen.delete(id) || changed;
+    for (const a of alerts) if (!seen.has(String(a.id))) changed = Boolean(seen.add(String(a.id)));
+    if (changed) saveSeenAlerts(seen);
+  }
+
+  function listBox(width, height, color) {
+    syncSelection();
+    const data = state.loading ? { ...state.data, notice: 'Loading departures…' } : state.data;
+    const { lines, alerts } = buildBoardBody(data, { filters: state.filters, showAlerts: state.showAlerts, selectable: true, selectedKey: state.selectedKey }, theme, width);
+    if (state.showAlerts && !state.loading) markAlertsSeen(alerts);
+    const countdown = Math.max(0, Math.ceil((state.nextFetchAt - Date.now()) / 1000));
+    const b = boardBorders(data, { filters: state.filters, showAlerts: state.showAlerts, seen: state.seenAlerts, countdown, interactive: true, width }, theme, alerts);
+    const top = borderLine(width, [theme.g.tl, theme.g.tr], b.top, [], theme, color);
+    const bottom = promptOrFlash(width, [theme.g.bl, theme.g.br], b.bottomLeft, b.bottomRight, color);
+    // Keep the selected row in view
+    const scrollable = lines.filter((l) => !l.header);
+    const selLine = scrollable.findIndex((l) => l.selected);
+    const rows = Math.max(1, height - 3 - lines.filter((l) => l.header).length);
+    if (state.selectedIndex === 0 || (selLine >= 0 && selLine < rows)) state.scroll = Math.min(state.scroll, Math.max(0, selLine));
+    if (selLine >= 0 && selLine < rows && state.selectedIndex <= firstTrainIndex(items())) state.scroll = 0;
+    else if (selLine >= 0) {
+      if (selLine < state.scroll) state.scroll = selLine;
+      if (selLine >= state.scroll + rows) state.scroll = selLine - rows + 1;
+    }
+    const f = box(width, height, top, lines, state.scroll, bottom, color);
+    state.scroll = f.scroll;
+    layout.list = f;
+    return f.lines;
+  }
+
+  function detailBox(width, height, color, focused) {
+    const item = selectedItem();
+    const train = item?.kind === 'train' ? item.train : null;
+    const { style } = theme;
+    const hints = focused
+      ? [style('j/k scroll', { dim: true }), style('J/K next', { dim: true }), style('h list', { dim: true })]
+      : [style('l details', { dim: true })];
+    const bottomFor = () =>
+      layout.twoCol
+        ? borderLine(width, [theme.g.bl, theme.g.br], hints, [], theme, color)
+        : promptOrFlash(width, [theme.g.bl, theme.g.br], hints, [style('? help', { dim: true })], color);
+    if (item?.kind === 'alert') {
+      const { left, right } = alertTitles(item.alert, theme);
+      const top = borderLine(width, [theme.g.tl, theme.g.tr], left, right, theme, color);
+      const f = box(width, height, top, buildAlertBody(item.alert, theme, width), state.detailScroll, bottomFor(), color);
+      state.detailScroll = f.scroll;
+      layout.detail = f;
+      return f.lines;
+    }
+    if (!train) {
+      const top = borderLine(width, [theme.g.tl, theme.g.tr], [style('Details', { bold: true })], [], theme, color);
+      const body = [{ text: style(state.loading ? 'Loading…' : 'No train selected', { dim: true }) }];
+      const f = box(width, height, top, body, 0, borderLine(width, [theme.g.bl, theme.g.br], [], [], theme, color), color);
+      layout.detail = f;
+      return f.lines;
+    }
+    const { left, right } = trainTitles(train, theme);
+    const top = borderLine(width, [theme.g.tl, theme.g.tr], left, right, theme, color);
+    const f = box(width, height, top, buildTrainBody(train, theme, width), state.detailScroll, bottomFor(), color);
+    state.detailScroll = f.scroll;
+    layout.detail = f;
+    return f.lines;
+  }
+
+  function draw() {
+    const width = Math.max(48, Math.min(out.columns || 100, 260));
+    const height = Math.max(8, out.rows || 24);
+    const footer = footerLines(width, theme, DATA_LINE);
+    const bodyH = Math.max(6, height - footer.length);
+    let lines;
+
+    if (state.help) {
+      const top = borderLine(width, [theme.g.tl, theme.g.tr], [theme.style('Help', { bold: true }), theme.style('PennAhead', { dim: true })], [theme.style('q / Esc close', { dim: true })], theme);
+      const f = box(width, bodyH, top, buildHelpBody(theme, width), state.helpScroll, borderLine(width, [theme.g.bl, theme.g.br], [], [], theme), BORDER);
+      state.helpScroll = f.scroll;
+      layout.help = f;
+      lines = f.lines;
+    } else {
+      // Two columns when there's room: the list on the left, the selected train on the right
+      layout.twoCol = width >= 120;
+      if (layout.twoCol) {
+        const rightW = Math.max(52, Math.min(96, Math.floor(width * 0.42)));
+        const leftW = width - rightW;
+        const listFocused = state.focus === 'list';
+        const L = listBox(leftW, bodyH, listFocused ? BORDER_FOCUS : BORDER);
+        const R = detailBox(rightW, bodyH, listFocused ? BORDER : BORDER_FOCUS, !listFocused);
+        lines = L.map((l, i) => l + (R[i] ?? ''));
+      } else {
+        lines = state.focus === 'detail' && selectedItem() ? detailBox(width, bodyH, BORDER, true) : listBox(width, bodyH, BORDER);
+      }
+    }
+    const screen = theme.fold([...lines, ...footer].slice(0, height).join('\n'));
+    out.write('\x1b[H' + screen.split('\n').map((l) => `${l}\x1b[K`).join('\n') + '\x1b[J');
+  }
+
+  function search(query, direction = 1) {
+    const list = items();
+    const q = query.toLowerCase();
+    if (!list.length || !q) return;
+    const matches = (it) =>
+      it.kind === 'train'
+        ? String(it.train.train_id).includes(q) || cleanDestination(it.train.destination).toLowerCase().includes(q) || it.train.line.toLowerCase() === q
+        : it.alert.text.toLowerCase().includes(q);
+    for (let step = 1; step <= list.length; step++) {
+      const i = (((state.selectedIndex + direction * step) % list.length) + list.length) % list.length;
+      if (matches(list[i])) {
+        select(i);
+        return;
+      }
+    }
+    flash(`No match: ${query}`);
+  }
+
+  function runCommand(cmd) {
+    const c = cmd.trim().replace(/^#/, '');
+    if (['q', 'q!', 'quit', 'qa', 'wq', 'x'].includes(c)) quit(0);
+    if (/^\w?\d+$/.test(c)) return goToTrain(c);
+    if (c === 'help' || c === 'h') {
+      state.help = true;
+      state.helpScroll = 0;
+      return;
+    }
+    if (c) flash(`Not a command: ${c}`);
+  }
+
+  function toggleLine(line) {
+    const l = state.filters.lines;
+    state.filters.lines = l.includes(line) ? l.filter((x) => x !== line) : [...l, line];
+  }
+
+  const page = (pane) => Math.max(1, layout[pane].rows - 1);
+  const half = (pane) => Math.max(1, Math.floor(layout[pane].rows / 2));
+  const scrollPane = (key, pane, delta) => (state[key] = Math.max(0, Math.min(layout[pane].maxScroll ?? 0, state[key] + delta)));
+
+  function handleKey(key) {
+    if (key === 'ctrl-c') quit(0);
+
+    if (state.prompt) {
+      const p = state.prompt;
+      if (key === 'esc') state.prompt = null;
+      else if (key === 'enter') {
+        state.prompt = null;
+        if (p.kind === '/') {
+          state.lastSearch = p.text;
+          search(p.text, 1);
+        } else runCommand(p.text);
+      } else if (key === 'backspace') {
+        if (p.text) p.text = p.text.slice(0, -1);
+        else state.prompt = null;
+      } else if (key.length === 1) p.text += key;
+      return;
+    }
+
+    if (state.pending) {
+      const pending = state.pending;
+      state.pending = null;
+      if (pending === 'g' && key === 'g') {
+        if (state.help) state.helpScroll = 0;
+        else if (state.focus === 'detail') state.detailScroll = 0;
+        else select(0);
+        return;
+      }
+      if (pending === 'w') {
+        if (key === 'h' || key === 'left') state.focus = 'list';
+        else if ((key === 'l' || key === 'right') && selectedItem()) state.focus = 'detail';
+        else if (key === 'w' || key === 'ctrl-w') state.focus = state.focus === 'list' && selectedItem() ? 'detail' : 'list';
+        return;
+      }
+    }
+
+    if (state.help) {
+      if (['q', 'esc', '?', 'h', 'left', 'enter'].includes(key)) state.help = false;
+      else if (key === 'j' || key === 'down') scrollPane('helpScroll', 'help', 1);
+      else if (key === 'k' || key === 'up') scrollPane('helpScroll', 'help', -1);
+      else if (key === 'ctrl-d') scrollPane('helpScroll', 'help', half('help'));
+      else if (key === 'ctrl-u') scrollPane('helpScroll', 'help', -half('help'));
+      else if (key === 'ctrl-f' || key === 'pagedown') scrollPane('helpScroll', 'help', page('help'));
+      else if (key === 'ctrl-b' || key === 'pageup') scrollPane('helpScroll', 'help', -page('help'));
+      else if (key === 'G' || key === 'end') state.helpScroll = Number.MAX_SAFE_INTEGER;
+      else if (key === 'g') state.pending = 'g';
+      return;
+    }
+
+    // Keys for both panes
+    switch (key) {
+      case '?':
+        state.help = true;
+        state.helpScroll = 0;
+        return;
+      case '/':
+      case ':':
+        state.prompt = { kind: key, text: '' };
+        return;
+      case 'r':
+        refresh();
+        return;
+      case 'a': {
+        // Show the alerts above the trains and select the first; again: hide them, back to the trains
+        state.showAlerts = !state.showAlerts;
+        state.focus = 'list';
+        const list = items();
+        if (state.showAlerts) {
+          if (list[0]?.kind === 'alert') select(0);
+          else flash('No service alerts');
+        } else if (!list.some((i) => i.key === state.selectedKey)) {
+          state.selectedKey = null; // the first train
+        }
+        state.scroll = 0;
+        return;
+      }
+      case '0':
+        state.filters.lines = [];
+        return;
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+        toggleLine(LINES[Number(key) - 1]);
+        return;
+      case 's':
+        state.filters.sec = !state.filters.sec;
+        return;
+      case 'e':
+        state.filters.ewr = !state.filters.ewr;
+        return;
+      case 'n':
+      case 'N':
+        if (state.lastSearch) search(state.lastSearch, key === 'n' ? 1 : -1);
+        return;
+      case 'J':
+        select(state.selectedIndex + 1);
+        return;
+      case 'K':
+        select(state.selectedIndex - 1);
+        return;
+      case 'g':
+        state.pending = 'g';
+        return;
+      case 'ctrl-w':
+        state.pending = 'w';
+        return;
+      case 'tab':
+        state.focus = state.focus === 'list' && selectedItem() ? 'detail' : 'list';
+        return;
+    }
+
+    if (state.focus === 'detail') {
+      if (['q', 'esc', 'h', 'left', 'backspace'].includes(key)) state.focus = 'list';
+      else if (key === 'j' || key === 'down') scrollPane('detailScroll', 'detail', 1);
+      else if (key === 'k' || key === 'up') scrollPane('detailScroll', 'detail', -1);
+      else if (key === 'ctrl-d') scrollPane('detailScroll', 'detail', half('detail'));
+      else if (key === 'ctrl-u') scrollPane('detailScroll', 'detail', -half('detail'));
+      else if (key === 'ctrl-f' || key === 'pagedown' || key === ' ') scrollPane('detailScroll', 'detail', page('detail'));
+      else if (key === 'ctrl-b' || key === 'pageup') scrollPane('detailScroll', 'detail', -page('detail'));
+      else if (key === 'G' || key === 'end') state.detailScroll = Number.MAX_SAFE_INTEGER;
+      else if (key === 'home') state.detailScroll = 0;
+      return;
+    }
+
+    // List
+    if (key === 'q') quit(0);
+    else if (key === 'j' || key === 'down') select(state.selectedIndex + 1);
+    else if (key === 'k' || key === 'up') select(state.selectedIndex - 1);
+    else if (key === 'ctrl-d') select(state.selectedIndex + half('list'));
+    else if (key === 'ctrl-u') select(state.selectedIndex - half('list'));
+    else if (key === 'ctrl-f' || key === 'pagedown' || key === ' ') select(state.selectedIndex + page('list'));
+    else if (key === 'ctrl-b' || key === 'pageup') select(state.selectedIndex - page('list'));
+    else if (key === 'G' || key === 'end') select(Number.MAX_SAFE_INTEGER);
+    else if (key === 'home') select(0);
+    else if ((key === 'enter' || key === 'l' || key === 'right') && selectedItem()) state.focus = 'detail';
+  }
+
+  stdin.on('data', (chunk) => {
+    for (const key of parseKeys(chunk)) handleKey(key);
+    draw();
+  });
+  out.on('resize', draw);
+  // Once a second: the countdown, flash messages, and the refresh when it's due
+  const tick = setInterval(() => {
+    if (Date.now() >= state.nextFetchAt) refresh();
+    else draw();
+  }, 1000);
+
+  draw();
+  await refresh();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Main
+
+async function main() {
+  let opts;
+  try {
+    opts = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    console.error(`pennahead: ${err.message}`);
+    process.exit(2);
+  }
+  if (opts.help) return console.log(USAGE);
+  if (opts.version) return console.log(VERSION);
+
+  const interactive = !opts.once && !opts.json && process.stdout.isTTY && process.stdin.isTTY;
+  if (interactive) return runInteractive(opts);
+
+  let data;
+  try {
+    data = await fetchBoard(opts.url);
+  } catch (err) {
+    console.error(`pennahead: couldn't reach ${opts.url}: ${err?.name === 'TimeoutError' ? 'timed out' : err?.message || err}`);
+    process.exit(1);
+  }
+
+  if (opts.json) {
+    const departures = opts.train
+      ? (data.departures || []).filter((d) => String(d.train_id) === opts.train)
+      : filterDepartures(data.departures || [], opts.filters);
+    const alerts = filterAlerts(data.alerts, opts.filters);
+    return console.log(JSON.stringify({ ...data, departures, alerts, attribution: DATA_LINE }, null, 2));
+  }
+
+  const theme = detectTheme(opts, process.stdout);
+  const width = termWidth(process.stdout);
+  if (opts.train) {
+    const train = (data.departures || []).find((d) => String(d.train_id) === opts.train);
+    if (!train) {
+      console.error(`pennahead: train #${opts.train} isn't on the board right now`);
+      process.exit(1);
+    }
+    return console.log(renderTrain(train, theme, width));
+  }
+  console.log(renderBoard(data, { ...opts, seen: loadSeenAlerts() }, theme, width));
+}
+
+const isMain = (() => {
+  try {
+    return process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+})();
+if (isMain) main();
